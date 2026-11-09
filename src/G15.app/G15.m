@@ -3,6 +3,9 @@
 //    barrinha na tela (como a do KDE). Controlador Alienware AW-ELC 187c:0551, relatorio de saida de 33 bytes sem
 //    report ID: 03 26 <dim> 00 04 00 01 02 03 00...  dim = 100 - brilho% (linux/g15-kbd, tools/test-kbd-backlight.py).
 //    O nivel e reaplicado ao iniciar, ao acordar e quando o controlador reaparece.
+//  - Luz do teclado (menu): janela com o desenho do teclado, 1 ou 4 zonas, cor (NSColorWell ou paleta), efeitos do
+//    controlador (fixo, respiracao, transicao, espectro, onda) com velocidade, brilho, predefinicoes, perfis com nome
+//    e o tempo para a luz apagar (BIOS, pelo G15Fan: KbdTimeout). O efeito e reaplicado junto com o brilho.
 //  - Fn+F9 (F17: scancode 0x68 -> ADB 0x40): passa pelos perfis Bateria -> Silencioso -> Balanceado -> Performance ->
 //    G-Mode -> Bateria, com a barrinha na tela (como o g15-kbd-sync no Linux). O boost das ventoinhas fica no menu.
 //  - Carregador: ao desconectar vai para Bateria, ao conectar para Balanceado (como o g15-power no Linux); ao abrir no
@@ -107,25 +110,115 @@ static void showHUD(NSString *symbol, NSString *text, double pct) {
 }
 
 // ---------- luz do teclado ----------
+// AW-ELC (testado no Fedora em 09/11/2026, tools/test-kbd-elc.py; protocolo do OpenRGB AlienwareController): relatorio
+// de saida de 33 bytes, resposta lida por GET_REPORT de entrada (83 <cmd> ...). Zonas 00 esquerda, 01 centro,
+// 02 direita, 03 numerico. Uma cor/efeito = 21 0001 FFFF (nova animacao temporaria) -> {23 01 <n> <zonas> ->
+// 24 <acoes>} por zona -> 21 0003 FFFF (fim e toca). Acao (8 bytes, ate 3 por pacote): modo 00 cor / 01 pulso /
+// 02 transicao, duracao em ms (16 bits: menor = mais rapido), tempo (16 bits), r g b. Brilho: 26 <dim> 00 04 00 01 02 03.
+// Nada e gravado na memoria do controlador: no boot ele volta a animacao padrao, e o app reaplica.
 static IOHIDManagerRef mgr;
 static NSInteger kbLevel = 2;                      // 0, 1, 2
 static const int KB_PCT[3] = {0, 50, 100};
+static dispatch_queue_t kbq;                       // pacotes do controlador em ordem, fora da thread principal
+static volatile NSUInteger kbGen;                  // cada nova cor cancela as que ainda nao comecaram
 
-static void kbSend(int pct) {
-    CFSetRef devs = IOHIDManagerCopyDevices(mgr);
+static void kbPackets(NSArray<NSData *> *pkts) {   // roda na kbq
+    CFSetRef devs = mgr ? IOHIDManagerCopyDevices(mgr) : NULL;
     CFIndex n = devs ? CFSetGetCount(devs) : 0;
     if (!n) { NSLog(@"AW-ELC 187c:0551 nao encontrado"); if (devs) CFRelease(devs); return; }
     const void *vals[n]; CFSetGetValues(devs, vals);
-    uint8_t r[33] = {0x03, 0x26, (uint8_t)(100 - pct), 0x00, 0x04, 0x00, 0x01, 0x02, 0x03};
     for (CFIndex i = 0; i < n; i++) {
-        IOReturn e = IOHIDDeviceSetReport((IOHIDDeviceRef)vals[i], kIOHIDReportTypeOutput, 0, r, sizeof r);
-        if (e == kIOReturnSuccess) NSLog(@"brilho %d%%", pct);
-        else NSLog(@"erro 0x%08x ao mandar brilho %d%%", e, pct);
+        IOHIDDeviceRef d = (IOHIDDeviceRef)vals[i];
+        for (NSData *p in pkts) {
+            IOReturn e = IOHIDDeviceSetReport(d, kIOHIDReportTypeOutput, 0, p.bytes, p.length);
+            if (e != kIOReturnSuccess) { NSLog(@"AW-ELC: erro 0x%08x no comando %02x", e, ((uint8_t *)p.bytes)[1]); break; }
+            uint8_t r[33]; CFIndex rl = sizeof r;          // a resposta do comando (o controlador espera ser lido)
+            IOHIDDeviceGetReport(d, kIOHIDReportTypeInput, 0, r, &rl);
+            usleep(30000);
+        }
     }
     CFRelease(devs);
 }
 
-static void kbApply(void) { kbSend(KB_PCT[kbLevel]); }
+static NSData *kbPkt(const uint8_t *b, size_t n) {
+    uint8_t r[33] = {0x03}; memcpy(r + 1, b, MIN(n, (size_t)32));
+    return [NSData dataWithBytes:r length:33];
+}
+
+static void kbSend(int pct) {                      // so o brilho (sincrono: tambem usado antes de dormir e na linha de comando)
+    if (!kbq) kbq = dispatch_queue_create("local.g15.awelc", DISPATCH_QUEUE_SERIAL);
+    uint8_t b[] = {0x26, (uint8_t)(100 - pct), 0x00, 0x04, 0x00, 0x01, 0x02, 0x03};
+    NSData *p = kbPkt(b, sizeof b);
+    dispatch_sync(kbq, ^{ kbPackets(@[p]); });
+    NSLog(@"brilho %d%%", pct);
+}
+
+// efeito salvo em prefs "kbLight": {effect: static|breath|morph|spectrum|wave, zones: 1|4, colors: [4 x "RRGGBB"],
+// color2: "RRGGBB", speed: 0..4}; perfis do usuario em "kbProfiles" {nome: efeito}
+static NSArray<NSString *> *kbEffects(void) { return @[@"static", @"breath", @"morph", @"spectrum", @"wave"]; }
+static const int KB_DUR[5] = {2400, 1400, 800, 450, 250};   // ms por passo; 300 com tempo 15 ficou bom na onda (Fedora)
+static const uint32_t KB_RAINBOW[7] = {0xFF0000, 0xFFA500, 0xFFFF00, 0x00C000, 0x00BFFF, 0x0000FF, 0x8000FF};
+
+static uint32_t hexColor(id s) { return [s isKindOfClass:NSString.class] ? (uint32_t)strtoul([s UTF8String], NULL, 16) & 0xFFFFFF : 0xFFFFFF; }
+
+static NSDictionary *kbDefaultLight(void) {
+    return @{@"effect": @"static", @"zones": @1, @"colors": @[@"FFFFFF", @"FFFFFF", @"FFFFFF", @"FFFFFF"], @"color2": @"0000FF", @"speed": @2};
+}
+static NSDictionary *kbLight(void) {
+    NSDictionary *d = [prefs dictionaryForKey:@"kbLight"];
+    return [d[@"colors"] isKindOfClass:NSArray.class] && [d[@"colors"] count] == 4 ? d : kbDefaultLight();
+}
+static uint32_t kbZoneColor(NSDictionary *L, int z) { return hexColor(L[@"colors"][[L[@"zones"] intValue] == 4 ? z : 0]); }
+
+static NSArray<NSData *> *kbLightPackets(NSDictionary *L) {
+    NSMutableArray *p = [NSMutableArray array];
+    NSString *fx = L[@"effect"] ?: @"static";
+    int sp = MAX(0, MIN(4, [L[@"speed"] intValue])), dur = KB_DUR[sp];
+    uint16_t tempo = [fx isEqualToString:@"static"] ? 0xFA : 0x0F;
+    BOOL one = [L[@"zones"] intValue] != 4 && ![fx isEqualToString:@"wave"];
+    uint8_t a1[] = {0x21, 0x00, 0x01, 0xFF, 0xFF, 0, 0};
+    [p addObject:kbPkt(a1, sizeof a1)];
+    for (int z = 0; z < (one ? 1 : 4); z++) {
+        if (one) { uint8_t s[] = {0x23, 1, 0, 4, 0, 1, 2, 3}; [p addObject:kbPkt(s, sizeof s)]; }
+        else     { uint8_t s[] = {0x23, 1, 0, 1, (uint8_t)z}; [p addObject:kbPkt(s, sizeof s)]; }
+        uint32_t c = kbZoneColor(L, z), c2 = hexColor(L[@"color2"]);
+        NSMutableArray<NSArray *> *acts = [NSMutableArray array];         // {modo, cor}
+        if ([fx isEqualToString:@"breath"])      { [acts addObject:@[@2, @(c)]]; [acts addObject:@[@2, @0]]; }
+        else if ([fx isEqualToString:@"morph"])  { [acts addObject:@[@2, @(c)]]; [acts addObject:@[@2, @(c2)]]; }
+        else if ([fx isEqualToString:@"spectrum"] || [fx isEqualToString:@"wave"]) {
+            int sh = [fx isEqualToString:@"wave"] ? z : 0;                // onda: cada zona um passo atras da anterior
+            for (int k = 0; k < 7; k++) [acts addObject:@[@2, @(KB_RAINBOW[(k - sh + 7) % 7])]];
+        } else [acts addObject:@[@0, @(c)]];
+        for (NSUInteger i = 0; i < acts.count; i += 3) {
+            uint8_t b[25] = {0x24}; size_t n = 1;
+            for (NSUInteger j = i; j < MIN(i + 3, acts.count); j++) {
+                uint32_t col = [acts[j][1] unsignedIntValue];
+                uint8_t a[8] = {[acts[j][0] unsignedCharValue], dur >> 8, dur & 255, tempo >> 8, tempo & 255,
+                                col >> 16, (col >> 8) & 255, col & 255};
+                memcpy(b + n, a, 8); n += 8;
+            }
+            [p addObject:kbPkt(b, n)];
+        }
+    }
+    uint8_t a3[] = {0x21, 0x00, 0x03, 0xFF, 0xFF, 0, 0};
+    [p addObject:kbPkt(a3, sizeof a3)];
+    uint8_t dm[] = {0x26, (uint8_t)(100 - KB_PCT[kbLevel]), 0x00, 0x04, 0x00, 0x01, 0x02, 0x03};
+    [p addObject:kbPkt(dm, sizeof dm)];
+    return p;
+}
+
+static void kbApplyLight(NSDictionary *L) {        // assincrono; so a ultima de uma sequencia rapida e mandada
+    if (!kbq) kbq = dispatch_queue_create("local.g15.awelc", DISPATCH_QUEUE_SERIAL);
+    NSArray *pk = kbLightPackets(L);
+    NSUInteger g = ++kbGen;
+    dispatch_async(kbq, ^{
+        if (g != kbGen) return;
+        kbPackets(pk);
+        NSLog(@"luz: %@ %@ zona(s), velocidade %@", L[@"effect"], L[@"zones"], L[@"speed"]);
+    });
+}
+
+static void kbApply(void) { kbApplyLight(kbLight()); }   // efeito + brilho
 
 static void kbApplySoon(double s) {                // o controlador pode demorar a aceitar comandos ao conectar/acordar
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ kbApply(); });
@@ -142,10 +235,13 @@ static void kbOpen(void) {
     if (e != kIOReturnSuccess) NSLog(@"IOHIDManagerOpen: 0x%08x", e);
 }
 
+static void kbWindowRefresh(void);                 // a janela da luz acompanha o Fn+F5
+
 static void kbSet(NSInteger lv, BOOL showOnScreen) {
     kbLevel = lv;
     [prefs setInteger:kbLevel forKey:@"level"];
-    kbApply();
+    kbSend(KB_PCT[kbLevel]);
+    kbWindowRefresh();
     if (showOnScreen)
         showHUD(kbLevel ? @"light.max" : @"light.min", kbLevel ? [NSString stringWithFormat:L("Luz do teclado: %d%%", "Keyboard light: %d%%"), KB_PCT[kbLevel]]
                                                                : L("Luz do teclado: apagada", "Keyboard light: off"), KB_PCT[kbLevel]);
@@ -548,6 +644,424 @@ static BOOL nsSetAtten(int db) {
     return YES;
 }
 
+// ---------- janela da luz do teclado ----------
+// Desenho do teclado do G15 5530 (4 zonas: esquerda, centro, direita, numerico) com previa ao vivo do efeito, cor por
+// zona (NSColorWell ou paleta), efeito e velocidade, brilho, predefinicoes, perfis com nome e o tempo da luz (BIOS,
+// pelo G15Fan: KbdTimeout). Tudo em prefs local.g15 (kbLight, kbProfiles, kbProfile).
+typedef struct { CGFloat x, y, w, h; const char *t; int z; } KbKey;
+static KbKey kbKeys[120]; static int kbNKeys;
+static const CGFloat KB_W = 19.6, KB_H = 5.75;     // unidades: area principal 15 + vao 0.6 + numerico 4
+
+static void kbAddRow(CGFloat y, CGFloat h, const char *spec) {   // "rotulo:largura|..." ; largura 0 = 1
+    CGFloat x = 0; char buf[400]; strncpy(buf, spec, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char *tok = strtok(buf, "|"); tok; tok = strtok(NULL, "|")) {
+        char *c = strrchr(tok, ':'); CGFloat w = 1;
+        if (c) { *c = 0; w = atof(c + 1); }
+        if (strcmp(tok, "_")) {
+            CGFloat cx = x + w / 2;
+            kbKeys[kbNKeys] = (KbKey){x, y, w, h, strdup(tok), x >= 15.3 ? 3 : cx < 5.2 ? 0 : cx < 10.2 ? 1 : 2};
+            kbNKeys++;
+        }
+        x += w;
+    }
+}
+
+static void kbBuildKeys(void) {
+    if (kbNKeys) return;
+    CGFloat fr = 0.62;                             // linha das F (mais baixa), de cima para baixo
+    kbAddRow(0, fr, "esc|F1|F2|F3|F4|F5|F6|F7|F8|F9|F10|F11|F12|prt|ins|_:0.6|del|home|end|pgup");
+    CGFloat y = fr + 0.08;
+    kbAddRow(y, 1, "'|1|2|3|4|5|6|7|8|9|0|-|=|⌫:2|_:0.6|num|/|*|−");
+    kbAddRow(y + 1, 1, "⇥:1.5|Q|W|E|R|T|Y|U|I|O|P|´|[:1.25|↩:1.25|_:0.6|7|8|9|+");
+    kbAddRow(y + 2, 1, "⇪:1.75|A|S|D|F|G|H|J|K|L|Ç|~|]|_:1.25|_:0.6|4|5|6");
+    kbAddRow(y + 3, 1, "⇧:1.25|\\|Z|X|C|V|B|N|M|,|.|;|⇧:1.75|↑|_:0.6|1|2|3|⏎");
+    kbAddRow(y + 4, 1, "ctrl:1.25|fn|❖|alt:1.25|:5.5|alt|ctrl|←|↓|→|_:0.6|0:2|,");
+    for (int i = 0; i < kbNKeys; i++)              // Enter (ABNT) e + / Enter do numerico ocupam duas linhas
+        if (!strcmp(kbKeys[i].t, "↩") || !strcmp(kbKeys[i].t, "⏎") || (!strcmp(kbKeys[i].t, "+") && kbKeys[i].z == 3)) kbKeys[i].h = 2;
+}
+
+static void rgbOf(uint32_t c, CGFloat v[3]) { v[0] = (c >> 16 & 255) / 255.0; v[1] = (c >> 8 & 255) / 255.0; v[2] = (c & 255) / 255.0; }
+
+// cor de uma zona no instante t (s), imitando o controlador: cada acao de transicao vai da cor anterior ate a sua
+static void kbPreview(NSDictionary *L, int z, double t, CGFloat out[3]) {
+    NSString *fx = L[@"effect"] ?: @"static";
+    double dur = KB_DUR[MAX(0, MIN(4, [L[@"speed"] intValue]))] / 1000.0;
+    uint32_t seq[7]; int n = 0;
+    uint32_t c = kbZoneColor(L, z);
+    if ([fx isEqualToString:@"breath"]) { seq[n++] = c; seq[n++] = 0; }
+    else if ([fx isEqualToString:@"morph"]) { seq[n++] = c; seq[n++] = hexColor(L[@"color2"]); }
+    else if ([fx isEqualToString:@"spectrum"] || [fx isEqualToString:@"wave"]) {
+        int sh = [fx isEqualToString:@"wave"] ? z : 0;
+        for (int k = 0; k < 7; k++) seq[n++] = KB_RAINBOW[(k - sh + 7) % 7];
+    } else { rgbOf(c, out); return; }
+    double pos = t / dur; int i = (int)floor(pos) % n; double f = pos - floor(pos);
+    f = f * f * (3 - 2 * f);
+    CGFloat a[3], b[3]; rgbOf(seq[(i + n - 1) % n], a); rgbOf(seq[i], b);
+    for (int k = 0; k < 3; k++) out[k] = a[k] + (b[k] - a[k]) * f;
+}
+
+@interface G15KbView : NSView
+@property (copy) NSDictionary *light;
+@property NSInteger level, selZone;
+@property (copy) void (^onZone)(int z);
+@end
+
+@implementation G15KbView { NSTimer *_timer; CFTimeInterval _t0; }
+- (BOOL)isFlipped { return YES; }
+- (void)viewDidMoveToWindow {
+    [_timer invalidate]; _timer = nil;
+    if (!self.window) return;
+    _t0 = NSProcessInfo.processInfo.systemUptime;
+    __weak G15KbView *w = self;
+    _timer = [NSTimer timerWithTimeInterval:1 / 30.0 repeats:YES block:^(NSTimer *t) {
+        G15KbView *s = w; if (!s) { [t invalidate]; return; }
+        if (s.window.isVisible && ![s.light[@"effect"] isEqualToString:@"static"] && s.level) s.needsDisplay = YES;
+    }];
+    [NSRunLoop.mainRunLoop addTimer:_timer forMode:NSRunLoopCommonModes];
+}
+- (NSRect)keyArea {
+    NSRect b = NSInsetRect(self.bounds, 34, 26);
+    CGFloat u = MIN(b.size.width / KB_W, b.size.height / KB_H);
+    return NSMakeRect(NSMidX(b) - u * KB_W / 2, NSMidY(b) - u * KB_H / 2, u * KB_W, u * KB_H);
+}
+- (NSRect)rectFor:(KbKey)k in:(NSRect)a {
+    CGFloat u = a.size.width / KB_W, g = u * 0.09;
+    return NSMakeRect(a.origin.x + k.x * u + g / 2, a.origin.y + k.y * u + g / 2, k.w * u - g, k.h * u - g);
+}
+- (void)drawRect:(NSRect)dirty {
+    kbBuildKeys();
+    BOOL dark = [self.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] == NSAppearanceNameDarkAqua;
+    // chassi: aluminio escuro com borda e brilho em cima
+    NSRect ch = NSInsetRect(self.bounds, 6, 6);
+    NSBezierPath *body = [NSBezierPath bezierPathWithRoundedRect:ch xRadius:22 yRadius:22];
+    NSGradient *gr = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:dark ? 0.17 : 0.24 alpha:1]
+                                                   endingColor:[NSColor colorWithWhite:dark ? 0.09 : 0.14 alpha:1]];
+    [gr drawInBezierPath:body angle:90];
+    [[NSColor colorWithWhite:1 alpha:0.10] setStroke]; body.lineWidth = 1; [body stroke];
+
+    NSRect a = [self keyArea];
+    CGFloat u = a.size.width / KB_W;
+    double t = NSProcessInfo.processInfo.systemUptime - _t0;
+    CGFloat lv = self.level == 0 ? 0 : self.level == 1 ? 0.55 : 1;
+    CGFloat zc[4][3];
+    for (int z = 0; z < 4; z++) kbPreview(self.light, z, t, zc[z]);
+    NSFont *f = [NSFont systemFontOfSize:MAX(7, u * 0.25) weight:NSFontWeightMedium];
+    NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new]; ps.alignment = NSTextAlignmentCenter;
+    for (int i = 0; i < kbNKeys; i++) {
+        KbKey k = kbKeys[i];
+        NSRect r = [self rectFor:k in:a];
+        CGFloat *c = zc[k.z];
+        NSColor *glow = [NSColor colorWithSRGBRed:c[0] green:c[1] blue:c[2] alpha:1];
+        NSBezierPath *kp = [NSBezierPath bezierPathWithRoundedRect:r xRadius:u * 0.14 yRadius:u * 0.14];
+        [NSGraphicsContext saveGraphicsState];
+        if (lv > 0) {                              // brilho da luz vazando em volta da tecla
+            NSShadow *sh = [NSShadow new];
+            sh.shadowColor = [glow colorWithAlphaComponent:0.85 * lv]; sh.shadowBlurRadius = u * 0.35; sh.shadowOffset = NSZeroSize;
+            [sh set];
+        }
+        [[NSColor colorWithWhite:0.07 alpha:1] setFill]; [kp fill];
+        [NSGraphicsContext restoreGraphicsState];
+        NSGradient *kg = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:0.20 alpha:1] endingColor:[NSColor colorWithWhite:0.11 alpha:1]];
+        [kg drawInBezierPath:kp angle:-90];
+        if (lv > 0) { [[glow colorWithAlphaComponent:0.30 * lv] setFill]; [kp fill]; }
+        NSColor *tc = lv > 0 ? [NSColor colorWithSRGBRed:0.35 + 0.65 * c[0] green:0.35 + 0.65 * c[1] blue:0.35 + 0.65 * c[2] alpha:0.35 + 0.65 * lv]
+                             : [NSColor colorWithWhite:0.45 alpha:1];
+        NSString *s = [NSString stringWithUTF8String:k.t];
+        NSDictionary *at = @{NSFontAttributeName: f, NSForegroundColorAttributeName: tc, NSParagraphStyleAttributeName: ps};
+        NSSize sz = [s sizeWithAttributes:at];
+        [s drawInRect:NSMakeRect(r.origin.x, NSMidY(r) - sz.height / 2, r.size.width, sz.height) withAttributes:at];
+    }
+    if ([self.light[@"zones"] intValue] == 4 && self.selZone >= 0) {   // zona escolhida: contorno na cor de destaque
+        NSRect zr = NSZeroRect;
+        for (int i = 0; i < kbNKeys; i++) if (kbKeys[i].z == self.selZone) zr = NSIsEmptyRect(zr) ? [self rectFor:kbKeys[i] in:a] : NSUnionRect(zr, [self rectFor:kbKeys[i] in:a]);
+        NSBezierPath *zp = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(zr, -u * 0.12, -u * 0.12) xRadius:u * 0.25 yRadius:u * 0.25];
+        zp.lineWidth = 2; [[NSColor.controlAccentColor colorWithAlphaComponent:0.95] setStroke]; [zp stroke];
+    }
+}
+- (void)mouseDown:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSRect a = [self keyArea];
+    for (int i = 0; i < kbNKeys; i++)
+        if (NSPointInRect(p, NSInsetRect([self rectFor:kbKeys[i] in:a], -3, -3))) { if (self.onZone) self.onZone(kbKeys[i].z); return; }
+}
+@end
+
+static NSString *hexOf(NSColor *c) {
+    NSColor *s = [c colorUsingColorSpace:NSColorSpace.sRGBColorSpace] ?: NSColor.whiteColor;
+    return [NSString stringWithFormat:@"%02X%02X%02X", (int)lround(s.redComponent * 255), (int)lround(s.greenComponent * 255), (int)lround(s.blueComponent * 255)];
+}
+static NSColor *colorOf(uint32_t c) { CGFloat v[3]; rgbOf(c, v); return [NSColor colorWithSRGBRed:v[0] green:v[1] blue:v[2] alpha:1]; }
+
+// predefinicoes: nome, efeito ("off" = apaga a luz)
+static NSArray<NSArray *> *kbPresets(void) {
+    NSDictionary *(^S)(NSString *, int, NSArray *) = ^(NSString *fx, int zones, NSArray *cs) {
+        return @{@"effect": fx, @"zones": @(zones), @"colors": cs.count == 4 ? cs : @[cs[0], cs[0], cs[0], cs[0]], @"color2": @"000000", @"speed": @2};
+    };
+    return @[@[L("Branco", "White"), S(@"static", 1, @[@"FFFFFF"])],
+             @[@"Alienware", S(@"static", 1, @[@"00A6FF"])],
+             @[L("Vermelho", "Red"), S(@"static", 1, @[@"FF1A1A"])],
+             @[L("Roxo", "Purple"), S(@"static", 1, @[@"8A2BE2"])],
+             @[@"Aurora", S(@"static", 4, @[@"00FFC8", @"00A0FF", @"7040FF", @"FF40C0"])],
+             @[L("Pôr do sol", "Sunset"), S(@"static", 4, @[@"FF1500", @"FF5A00", @"FFA000", @"FF0060"])],
+             @[L("Respiração", "Breathing"), S(@"breath", 1, @[@"00A6FF"])],
+             @[L("Espectro", "Spectrum"), S(@"spectrum", 1, @[@"FFFFFF"])],
+             @[L("Onda", "Wave"), S(@"wave", 4, @[@"FFFFFF"])],
+             @[L("Apagada", "Off"), @"off"]];
+}
+
+static NSImage *presetImage(id p) {
+    return [NSImage imageWithSize:NSMakeSize(34, 34) flipped:NO drawingHandler:^BOOL(NSRect r) {
+        NSRect c = NSInsetRect(r, 2, 2);
+        NSBezierPath *o = [NSBezierPath bezierPathWithOvalInRect:c];
+        if (![p isKindOfClass:NSDictionary.class]) {
+            [[NSColor colorWithWhite:0.15 alpha:1] setFill]; [o fill];
+            [[NSColor colorWithWhite:0.5 alpha:1] setStroke]; [o stroke];
+            return YES;
+        }
+        NSString *fx = p[@"effect"];
+        [NSGraphicsContext saveGraphicsState]; [o addClip];
+        if ([fx isEqualToString:@"spectrum"] || [fx isEqualToString:@"wave"]) {
+            NSMutableArray *cs = [NSMutableArray array]; for (int k = 0; k < 7; k++) [cs addObject:colorOf(KB_RAINBOW[k])];
+            [[[NSGradient alloc] initWithColors:cs] drawInRect:c angle:[fx isEqualToString:@"wave"] ? 0 : 90];
+        } else if ([fx isEqualToString:@"breath"]) {
+            [[[NSGradient alloc] initWithStartingColor:colorOf(kbZoneColor(p, 0)) endingColor:NSColor.blackColor] drawInBezierPath:o relativeCenterPosition:NSZeroPoint];
+        } else if ([p[@"zones"] intValue] == 4) {
+            for (int z = 0; z < 4; z++) { [colorOf(kbZoneColor(p, z)) setFill]; NSRectFill(NSMakeRect(c.origin.x + z * c.size.width / 4, c.origin.y, c.size.width / 4 + 0.5, c.size.height)); }
+        } else { [colorOf(kbZoneColor(p, 0)) setFill]; [o fill]; }
+        [NSGraphicsContext restoreGraphicsState];
+        [[NSColor colorWithWhite:1 alpha:0.25] setStroke]; [o stroke];
+        return YES;
+    }];
+}
+
+@interface G15KbWindow : NSObject <NSWindowDelegate>
+@end
+
+@implementation G15KbWindow {
+    NSWindow *_w; G15KbView *_kb; NSMutableDictionary *_cur; NSInteger _zone;
+    NSSegmentedControl *_zonesSeg, *_zoneSeg, *_levelSeg;
+    NSColorWell *_well, *_well2; NSTextField *_well2Label; NSPopUpButton *_fx, *_tmo, *_prof; NSSlider *_speed;
+    NSButton *_del;
+}
+
+static G15KbWindow *kbWin;
+
+- (NSTextField *)label:(NSString *)s at:(NSPoint)p in:(NSView *)v {
+    NSTextField *l = [NSTextField labelWithString:s];
+    l.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium]; l.textColor = NSColor.secondaryLabelColor;
+    [l sizeToFit]; [l setFrameOrigin:p]; [v addSubview:l];
+    return l;
+}
+- (NSBox *)card:(NSRect)r in:(NSView *)v {
+    NSBox *b = [[NSBox alloc] initWithFrame:r];
+    b.boxType = NSBoxCustom; b.cornerRadius = 12; b.borderWidth = 0; b.titlePosition = NSNoTitle;
+    b.fillColor = [NSColor.labelColor colorWithAlphaComponent:0.05]; b.contentViewMargins = NSZeroSize;
+    [v addSubview:b];
+    return b;
+}
+
+- (void)build {
+    _w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 800, 610)
+                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
+                                       backing:NSBackingStoreBuffered defer:NO];
+    _w.titlebarAppearsTransparent = YES; _w.titleVisibility = NSWindowTitleHidden; _w.movableByWindowBackground = YES;
+    _w.releasedWhenClosed = NO; _w.delegate = self; _w.title = L("Luz do teclado", "Keyboard light");
+    NSVisualEffectView *v = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 800, 610)];
+    v.material = NSVisualEffectMaterialSidebar; v.blendingMode = NSVisualEffectBlendingModeBehindWindow; v.state = NSVisualEffectStateActive;
+    _w.contentView = v;
+
+    NSTextField *t = [NSTextField labelWithString:L("Luz do teclado", "Keyboard light")];
+    t.font = [NSFont systemFontOfSize:22 weight:NSFontWeightBold]; [t sizeToFit]; [t setFrameOrigin:NSMakePoint(28, 552)]; [v addSubview:t];
+    NSTextField *st = [NSTextField labelWithString:@"Dell G15 5530 · Alienware AW-ELC · 4 zonas"];
+    st.font = [NSFont systemFontOfSize:12]; st.textColor = NSColor.secondaryLabelColor; [st sizeToFit];
+    [st setFrameOrigin:NSMakePoint(30, 534)]; [v addSubview:st];
+
+    _kb = [[G15KbView alloc] initWithFrame:NSMakeRect(20, 270, 760, 256)];
+    __weak G15KbWindow *ws = self;
+    _kb.onZone = ^(int z) { [ws pickZone:z]; };
+    [v addSubview:_kb];
+
+    _zonesSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("1 zona", "1 zone"), L("4 zonas", "4 zones")]
+                                                  trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(zonesChanged:)];
+    _zonesSeg.frame = NSMakeRect(28, 230, 170, 26); [v addSubview:_zonesSeg];
+    _zoneSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Esquerda", "Left"), L("Centro", "Center"), L("Direita", "Right"), L("Numérico", "Numpad")]
+                                                 trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(zoneChanged:)];
+    _zoneSeg.frame = NSMakeRect(212, 230, 360, 26); [v addSubview:_zoneSeg];
+    NSTextField *hint = [self label:L("ou clique numa zona do desenho", "or click a zone in the drawing") at:NSMakePoint(584, 235) in:v];
+    hint.font = [NSFont systemFontOfSize:11];
+
+    NSBox *ca = [self card:NSMakeRect(24, 96, 370, 120) in:v]; NSView *a = ca.contentView;
+    [self label:L("Cor", "Color") at:NSMakePoint(16, 86) in:a];
+    _well = [NSColorWell colorWellWithStyle:NSColorWellStyleExpanded];
+    _well.frame = NSMakeRect(78, 80, 64, 28); _well.target = self; _well.action = @selector(colorChanged:); [a addSubview:_well];
+    const uint32_t pal[8] = {0xFFFFFF, 0x00A6FF, 0x0040FF, 0x8A2BE2, 0xFF1A1A, 0xFF7A00, 0xFFD000, 0x00E060};
+    for (int i = 0; i < 8; i++) {
+        NSButton *b = [NSButton buttonWithImage:presetImage(@{@"effect": @"static", @"zones": @1, @"colors": @[[NSString stringWithFormat:@"%06X", pal[i]], @"", @"", @""]})
+                                         target:self action:@selector(paletteClicked:)];
+        b.bordered = NO; b.imageScaling = NSImageScaleProportionallyDown; b.tag = pal[i];
+        b.frame = NSMakeRect(152 + i * 26, 82, 24, 24); [a addSubview:b];
+    }
+    [self label:L("Efeito", "Effect") at:NSMakePoint(16, 50) in:a];
+    _fx = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(74, 44, 150, 26) pullsDown:NO];
+    [_fx addItemsWithTitles:@[L("Fixo", "Static"), L("Respiração", "Breathing"), L("Transição", "Morph"), L("Espectro", "Spectrum"), L("Onda", "Wave")]];
+    _fx.target = self; _fx.action = @selector(fxChanged:); [a addSubview:_fx];
+    _well2Label = [self label:L("2ª cor", "2nd color") at:NSMakePoint(236, 50) in:a];
+    _well2 = [NSColorWell colorWellWithStyle:NSColorWellStyleMinimal];
+    _well2.frame = NSMakeRect(290, 44, 60, 26); _well2.target = self; _well2.action = @selector(color2Changed:); [a addSubview:_well2];
+    [self label:L("Velocidade", "Speed") at:NSMakePoint(16, 14) in:a];
+    _speed = [NSSlider sliderWithValue:2 minValue:0 maxValue:4 target:self action:@selector(speedChanged:)];
+    _speed.numberOfTickMarks = 5; _speed.allowsTickMarkValuesOnly = YES; _speed.frame = NSMakeRect(100, 8, 250, 26); [a addSubview:_speed];
+
+    NSBox *cb = [self card:NSMakeRect(406, 96, 370, 120) in:v]; NSView *b = cb.contentView;
+    [self label:L("Brilho", "Brightness") at:NSMakePoint(16, 86) in:b];
+    _levelSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Apagada", "Off"), @"50%", @"100%"]
+                                                  trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(levelChanged:)];
+    _levelSeg.frame = NSMakeRect(110, 80, 240, 26); [b addSubview:_levelSeg];
+    [self label:L("Apagar após", "Turn off after") at:NSMakePoint(16, 50) in:b];
+    _tmo = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(110, 44, 150, 26) pullsDown:NO];
+    const int ts[8] = {5, 10, 15, 30, 60, 300, 900, 0};
+    for (int i = 0; i < 8; i++) {
+        int s = ts[i];
+        [_tmo addItemWithTitle:s == 0 ? L("Nunca", "Never") : s < 60 ? [NSString stringWithFormat:@"%d s", s] : [NSString stringWithFormat:@"%d min", s / 60]];
+        _tmo.lastItem.tag = s;
+    }
+    _tmo.target = self; _tmo.action = @selector(timeoutChanged:); [b addSubview:_tmo];
+    [self label:L("Perfil", "Profile") at:NSMakePoint(16, 14) in:b];
+    _prof = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(66, 8, 150, 26) pullsDown:NO];
+    _prof.target = self; _prof.action = @selector(profilePicked:); [b addSubview:_prof];
+    NSButton *sv = [NSButton buttonWithTitle:L("Salvar…", "Save…") target:self action:@selector(profileSave:)];
+    sv.frame = NSMakeRect(220, 8, 74, 26); [b addSubview:sv];
+    _del = [NSButton buttonWithTitle:L("Apagar", "Delete") target:self action:@selector(profileDelete:)];
+    _del.frame = NSMakeRect(294, 8, 68, 26); [b addSubview:_del];
+
+    NSTextField *pt = [self label:L("PREDEFINIÇÕES", "PRESETS") at:NSMakePoint(30, 70) in:v];
+    pt.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    NSArray *ps = kbPresets();
+    for (NSUInteger i = 0; i < ps.count; i++) {
+        NSButton *p = [NSButton buttonWithTitle:ps[i][0] image:presetImage(ps[i][1]) target:self action:@selector(presetClicked:)];
+        p.imagePosition = NSImageAbove; p.bordered = NO; p.tag = i; p.font = [NSFont systemFontOfSize:11];
+        p.frame = NSMakeRect(24 + i * 75.2, 12, 72, 56); [v addSubview:p];
+    }
+    [_w center];
+}
+
+- (void)sync {                                     // controles a partir do estado
+    _cur = [kbLight() mutableCopy]; _cur[@"colors"] = [_cur[@"colors"] mutableCopy];
+    BOOL four = [_cur[@"zones"] intValue] == 4;
+    _zonesSeg.selectedSegment = four; _zoneSeg.enabled = four; _zoneSeg.selectedSegment = four ? _zone : -1;
+    _well.color = colorOf(kbZoneColor(_cur, four ? (int)_zone : 0));
+    _well2.color = colorOf(hexColor(_cur[@"color2"]));
+    NSUInteger fi = [kbEffects() indexOfObject:_cur[@"effect"]]; [_fx selectItemAtIndex:fi == NSNotFound ? 0 : fi];
+    NSString *fx = _cur[@"effect"];
+    BOOL rainbow = [fx isEqualToString:@"spectrum"] || [fx isEqualToString:@"wave"];
+    _well.enabled = !rainbow; _well2.hidden = _well2Label.hidden = ![fx isEqualToString:@"morph"];
+    _speed.doubleValue = [_cur[@"speed"] intValue]; _speed.enabled = ![fx isEqualToString:@"static"];
+    _levelSeg.selectedSegment = kbLevel;
+    _kb.light = _cur; _kb.level = kbLevel; _kb.selZone = _zone; _kb.needsDisplay = YES;
+    // perfis
+    NSDictionary *pr = [prefs dictionaryForKey:@"kbProfiles"];
+    [_prof removeAllItems]; [_prof addItemWithTitle:L("Personalizado", "Custom")];
+    for (NSString *n in [pr.allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) [_prof addItemWithTitle:n];
+    NSString *sel = [prefs stringForKey:@"kbProfile"];
+    if (sel && pr[sel] && [pr[sel] isEqual:kbLight()]) [_prof selectItemWithTitle:sel]; else [_prof selectItemAtIndex:0];
+    _del.enabled = _prof.indexOfSelectedItem > 0;
+    // tempo da luz (BIOS, pelo G15Fan)
+    NSDictionary *kt = fanState(NO)[@"KbdTimeout"];
+    _tmo.enabled = [kt isKindOfClass:NSDictionary.class];
+    _tmo.toolTip = _tmo.enabled ? L("Tempo sem usar o teclado até a luz apagar (BIOS, na bateria e na tomada)", "Idle time until the light turns off (BIOS)")
+                                : L("Precisa do G15Fan.kext com o tempo da luz", "Needs the G15Fan.kext with keyboard timeout");
+    if (_tmo.enabled) [_tmo selectItemWithTag:[kt[@"Batt"] intValue]];
+}
+
+- (void)commit {                                   // grava, redesenha e manda ao controlador
+    [prefs setObject:_cur forKey:@"kbLight"];
+    [self sync];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(send) object:nil];
+    [self performSelector:@selector(send) withObject:nil afterDelay:0.12 inModes:@[NSRunLoopCommonModes]];
+}
+- (void)send { if (kbLevel == 0) kbSet(2, NO); kbApply(); }   // escolher uma cor com a luz apagada acende
+
+- (void)toFour {                                   // 1 -> 4 zonas: as quatro comecam na cor unica
+    NSString *c = _cur[@"colors"][0];
+    _cur[@"colors"] = [@[c, c, c, c] mutableCopy]; _cur[@"zones"] = @4;
+}
+- (void)pickZone:(int)z {                          // clique no desenho: escolhe a zona (e passa para 4 zonas)
+    _zone = z;
+    if ([_cur[@"zones"] intValue] != 4) { [self toFour]; [self commit]; } else [self sync];
+}
+- (void)zonesChanged:(NSSegmentedControl *)s {
+    if (s.selectedSegment == 1) { if ([_cur[@"zones"] intValue] != 4) [self toFour]; } else _cur[@"zones"] = @1;
+    [self commit];
+}
+- (void)zoneChanged:(NSSegmentedControl *)s { _zone = s.selectedSegment; [self sync]; }
+- (void)setColorHex:(NSString *)h {
+    NSMutableArray *cs = _cur[@"colors"];
+    if ([_cur[@"zones"] intValue] == 4) cs[_zone] = h; else for (int z = 0; z < 4; z++) cs[z] = h;
+    if ([_cur[@"effect"] isEqualToString:@"spectrum"] || [_cur[@"effect"] isEqualToString:@"wave"]) _cur[@"effect"] = @"static";
+    [self commit];
+}
+- (void)colorChanged:(NSColorWell *)w { [self setColorHex:hexOf(w.color)]; }
+- (void)paletteClicked:(NSButton *)b { [self setColorHex:[NSString stringWithFormat:@"%06lX", (long)b.tag]]; }
+- (void)color2Changed:(NSColorWell *)w { _cur[@"color2"] = hexOf(w.color); [self commit]; }
+- (void)fxChanged:(NSPopUpButton *)p { _cur[@"effect"] = kbEffects()[p.indexOfSelectedItem]; [self commit]; }
+- (void)speedChanged:(NSSlider *)s {
+    if ([_cur[@"speed"] intValue] == (int)lround(s.doubleValue)) return;
+    _cur[@"speed"] = @((int)lround(s.doubleValue)); [self commit];
+}
+- (void)levelChanged:(NSSegmentedControl *)s { kbSet(s.selectedSegment, NO); }
+- (void)timeoutChanged:(NSPopUpButton *)p {
+    if (fanWrite(@{@"KbdTimeout": @(p.selectedTag)}) != KERN_SUCCESS) NSBeep();
+    [self sync];
+}
+- (void)presetClicked:(NSButton *)b {
+    id p = kbPresets()[b.tag][1];
+    if (![p isKindOfClass:NSDictionary.class]) { kbSet(0, NO); return; }
+    _cur = [p mutableCopy]; _cur[@"colors"] = [p[@"colors"] mutableCopy]; _cur[@"speed"] = _cur[@"speed"] ?: @2;
+    _zone = 0; [self commit];
+}
+- (void)profilePicked:(NSPopUpButton *)p {
+    if (p.indexOfSelectedItem <= 0) { [prefs removeObjectForKey:@"kbProfile"]; [self sync]; return; }
+    NSDictionary *pr = [prefs dictionaryForKey:@"kbProfiles"][p.titleOfSelectedItem];
+    if (!pr) return;
+    [prefs setObject:p.titleOfSelectedItem forKey:@"kbProfile"];
+    _cur = [pr mutableCopy]; _cur[@"colors"] = [pr[@"colors"] mutableCopy]; [self commit];
+}
+- (void)profileSave:(id)s {
+    NSAlert *a = [NSAlert new];
+    a.messageText = L("Salvar perfil de luz", "Save light profile");
+    a.informativeText = L("Nome do perfil (o mesmo nome substitui o anterior):", "Profile name (same name replaces it):");
+    NSTextField *f = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
+    f.placeholderString = L("Ex.: Jogo, Noite", "e.g. Gaming, Night");
+    NSString *cur = [prefs stringForKey:@"kbProfile"]; if (cur) f.stringValue = cur;
+    a.accessoryView = f;
+    [a addButtonWithTitle:L("Salvar", "Save")]; [a addButtonWithTitle:L("Cancelar", "Cancel")];
+    a.window.initialFirstResponder = f;
+    [a beginSheetModalForWindow:_w completionHandler:^(NSModalResponse r) {
+        NSString *n = [f.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (r != NSAlertFirstButtonReturn || !n.length) return;
+        NSMutableDictionary *pr = [[prefs dictionaryForKey:@"kbProfiles"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        pr[n] = [self->_cur copy];
+        [prefs setObject:pr forKey:@"kbProfiles"]; [prefs setObject:n forKey:@"kbProfile"];
+        NSLog(@"luz: perfil \"%@\" salvo", n);
+        [self sync];
+    }];
+}
+- (void)profileDelete:(id)s {
+    NSString *n = _prof.titleOfSelectedItem; if (_prof.indexOfSelectedItem <= 0) return;
+    NSMutableDictionary *pr = [[prefs dictionaryForKey:@"kbProfiles"] mutableCopy];
+    [pr removeObjectForKey:n]; [prefs setObject:pr forKey:@"kbProfiles"]; [prefs removeObjectForKey:@"kbProfile"];
+    [self sync];
+}
+@end
+
+static void kbWindowOpen(void) {
+    if (!kbWin) { kbWin = [G15KbWindow new]; [kbWin build]; }
+    [kbWin sync];
+    [NSApp activateIgnoringOtherApps:YES];
+    [[kbWin valueForKey:@"_w"] makeKeyAndOrderFront:nil];
+}
+static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
+
 @interface G15Menu : NSObject <NSMenuDelegate>
 @property NSStatusItem *item;
 @end
@@ -637,12 +1151,14 @@ static BOOL nsSetAtten(int db) {
         [menu addItemWithTitle:[L("Perfil: ", "Profile: ") stringByAppendingString:profileName(cur)] action:nil keyEquivalent:@""].submenu = pm;
     }
 
-    NSMenu *km = [NSMenu new];
-    for (NSInteger i = 0; i < 3; i++)
-        [self add:km title:i ? [NSString stringWithFormat:@"%d%%", KB_PCT[i]] : L("Apagada", "Off") action:@selector(setKb:) tag:i on:kbLevel == i];
-    [menu addItemWithTitle:(kbLevel ? [NSString stringWithFormat:L("Luz do teclado: %d%%", "Keyboard light: %d%%"), KB_PCT[kbLevel]]
-                                    : L("Luz do teclado: apagada", "Keyboard light: off"))
-                    action:nil keyEquivalent:@""].submenu = km;
+    {   // luz do teclado: abre a janela (cores, zonas, efeitos, perfis); o Fn+F5 continua no brilho
+        NSDictionary *Lt = kbLight();
+        NSArray *fxn = @[L("fixa", "static"), L("respiração", "breathing"), L("transição", "morph"), L("espectro", "spectrum"), L("onda", "wave")];
+        NSUInteger fi = [kbEffects() indexOfObject:Lt[@"effect"]];
+        NSString *st = kbLevel ? [NSString stringWithFormat:@"%d%% · %@", KB_PCT[kbLevel], fxn[fi == NSNotFound ? 0 : fi]] : L("apagada", "off");
+        NSMenuItem *ki = [self add:menu title:[NSString stringWithFormat:L("Luz do teclado: %@…", "Keyboard light: %@…"), st] action:@selector(openKb:) tag:0 on:NO];
+        ki.image = [NSImage imageWithSystemSymbolName:@"keyboard" accessibilityDescription:nil];
+    }
 
     {   // barra de atenuacao do supressor de ruido do microfone
         int db = nsAtten();
@@ -693,7 +1209,7 @@ static BOOL nsSetAtten(int db) {
 - (void)nsSave:(NSNumber *)db { nsSetAtten(db.intValue); }
 - (void)setFan:(NSMenuItem *)i { setBoost((int)i.tag); }
 - (void)setProfile:(NSMenuItem *)i { applyProfile((int)i.tag); }
-- (void)setKb:(NSMenuItem *)i { kbSet(i.tag, NO); }
+- (void)openKb:(id)s { kbWindowOpen(); }
 - (void)openLog:(id)s {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/g15.log"]]];
 }

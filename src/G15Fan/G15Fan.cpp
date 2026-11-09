@@ -26,6 +26,13 @@
 //   nunca GONN (a RTX fica desligada a sessao inteira).
 //   escrita:  IORegistryEntrySetCFProperties com {"Refresh": qualquer}, {"FanBoost": 0..100} (todas as ventoinhas),
 //             {"Profile": id anunciado pelo firmware ou 0xAB = G-Mode}, {"GMode": bool} (desligar volta ao ultimo perfil). Escrita so do usuario da sessao grafica ou root.
+// Tempo da luz do teclado (09/11/2026): chamada SMBIOS da Dell classe 4 / select 11 pelo metodo \_SB.AMW0.WMBA (GUID
+//   A80593CE, o mesmo do dell-smbios-wmi do Linux; e o que o "stop_timeout" do dell::kbd_backlight usa). Buffer:
+//   u16 classe, u16 select, u32 entrada[4], u32 saida[4], u32 argattrib, u32 blength (0) = 0x2C bytes; o firmware
+//   devolve o buffer com a saida. Entrada[0] = 1 le o estado, 2 grava: entrada[1] = modo(bits 0-15) | gatilhos(16-23) |
+//   tempo bateria (24-29) | unidade (30-31: 0 s, 1 min, 2 h, 3 dias); entrada[2] = als | nivel<<16 | tempo e unidade
+//   na tomada (24-31). Tempo 0 = nunca apaga. Testado no Fedora (stop_timeout 5s apagou a luz em 5 s).
+//   escrita: {"KbdTimeout": segundos (0 = nunca)} nos dois (bateria e tomada); leitura: "KbdTimeout" = {Batt, AC} em s.
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
@@ -77,6 +84,10 @@ class G15Fan : public IOService {
     bool activate(uint8_t p);
 
     bool wmax(uint8_t method, uint8_t op, uint8_t a1, uint8_t a2, uint32_t *out);
+    IOACPIPlatformDevice *amw0 {nullptr};             // \_SB.AMW0 (WMBA = chamadas SMBIOS da Dell)
+    bool smbios(uint16_t cls, uint16_t sel, uint32_t in[4], uint32_t out[4]);
+    bool kbdTimeoutRead();
+    bool kbdTimeoutWrite(uint32_t secs);
     bool enumerate();
     void refresh();
 
@@ -106,6 +117,56 @@ bool G15Fan::wmax(uint8_t method, uint8_t op, uint8_t a1, uint8_t a2, uint32_t *
     if (!ok || v == 0xFFFFFFFF || v == 0xFFFFFFFE) return false;
     if (out) *out = v;
     return true;
+}
+
+bool G15Fan::smbios(uint16_t cls, uint16_t sel, uint32_t in[4], uint32_t out[4]) {
+    if (!amw0) return false;
+    uint8_t buf[0x2C] {};
+    memcpy(buf, &cls, 2); memcpy(buf + 2, &sel, 2); memcpy(buf + 4, in, 16);
+    OSNumber *inst = OSNumber::withNumber(0ULL, 32), *mid = OSNumber::withNumber(1ULL, 32);
+    OSData *arg = OSData::withBytes(buf, sizeof buf);
+    OSObject *params[3] = {inst, mid, arg}, *res = nullptr;
+    IOReturn r = (inst && mid && arg) ? amw0->evaluateObject("WMBA", &res, params, 3) : kIOReturnNoMemory;
+    OSSafeReleaseNULL(inst); OSSafeReleaseNULL(mid); OSSafeReleaseNULL(arg);
+    OSData *d = OSDynamicCast(OSData, res);
+    bool ok = r == kIOReturnSuccess && d && d->getLength() >= 0x24;
+    if (ok) memcpy(out, (const uint8_t *)d->getBytesNoCopy() + 0x14, 16);
+    OSSafeReleaseNULL(res);
+    return ok && out[0] == 0;                          // saida[0] = 0: sucesso
+}
+
+static uint32_t tmoSecs(uint32_t b) {                  // 6 bits de valor + 2 de unidade -> segundos
+    static const uint32_t mul[4] = {1, 60, 3600, 86400};
+    return (b & 0x3F) * mul[(b >> 6) & 3];
+}
+static uint32_t tmoBits(uint32_t s) {                  // segundos -> valor/unidade
+    if (s == 0) return 0;
+    if (s < 64) return s;
+    if (s < 64 * 60) return (1u << 6) | ((s + 59) / 60);
+    return (2u << 6) | ((s + 3599) / 3600 > 63 ? 63 : (s + 3599) / 3600);
+}
+
+bool G15Fan::kbdTimeoutRead() {
+    uint32_t in[4] = {1, 0, 0, 0}, out[4] {};
+    if (!smbios(4, 11, in, out)) return false;
+    OSDictionary *t = OSDictionary::withCapacity(2);
+    OSNumber *b = OSNumber::withNumber(tmoSecs(out[1] >> 24), 32), *a = OSNumber::withNumber(tmoSecs(out[2] >> 24), 32);
+    if (t && a && b) { t->setObject("Batt", b); t->setObject("AC", a); setProperty("KbdTimeout", t); }
+    OSSafeReleaseNULL(t); OSSafeReleaseNULL(a); OSSafeReleaseNULL(b);
+    return true;
+}
+
+bool G15Fan::kbdTimeoutWrite(uint32_t secs) {          // le o estado e regrava so os tempos (como o dell-laptop)
+    uint32_t in[4] = {1, 0, 0, 0}, cur[4] {}, out[4] {};
+    if (!smbios(4, 11, in, cur)) return false;
+    uint32_t tb = tmoBits(secs);
+    in[0] = 2;
+    in[1] = (cur[1] & 0x00FFFFFF) | (tb << 24);
+    in[2] = (cur[2] & 0x00FF00FF) | (tb << 24);
+    bool ok = smbios(4, 11, in, out);
+    LOG("tempo da luz do teclado %u s (%s)", secs, ok ? "ok" : "erro");
+    kbdTimeoutRead();
+    return ok;
 }
 
 bool G15Fan::enumerate() {
@@ -333,6 +394,20 @@ bool G15Fan::start(IOService *provider) {
     if (ok) refresh();
     IOLockUnlock(lock);
     if (!ok) { LOG("WMAX nao respondeu a descricao do sistema"); return false; }
+    {   // \_SB.AMW0 (PNP0C14 com WMBA): tempo da luz do teclado pelo SMBIOS da Dell
+        OSDictionary *m = nameMatching("PNP0C14");
+        OSIterator *it = m ? getMatchingServices(m) : nullptr;
+        OSSafeReleaseNULL(m);
+        while (OSObject *o = it ? it->getNextObject() : nullptr) {
+            auto dev = OSDynamicCast(IOACPIPlatformDevice, o);
+            if (dev && dev->validateObject("WMBA") == kIOReturnSuccess) { amw0 = dev; amw0->retain(); break; }
+        }
+        OSSafeReleaseNULL(it);
+        IOLockLock(lock);
+        bool kt = amw0 && kbdTimeoutRead();
+        IOLockUnlock(lock);
+        LOG("SMBIOS (AMW0.WMBA): %s", amw0 ? (kt ? "tempo da luz lido" : "sem resposta") : "nao achado");
+    }
     registerService();
     { char b[4]; pepOff = PE_parse_boot_argn("-g15fan-pep-off", b, sizeof b); }   // sem os avisos de Modern Standby
     sleepNotifier = registerPrioritySleepWakeInterest(sleepWake, this);   // sempre (armar o EC); a RTX so com o SSDT
@@ -356,6 +431,7 @@ void G15Fan::stop(IOService *provider) {
     if (pciNotifier) { pciNotifier->remove(); pciNotifier = nullptr; }
     if (peg1) { peg1->deRegisterInterestedDriver(this); OSSafeReleaseNULL(peg1); }
     OSSafeReleaseNULL(acpi);
+    OSSafeReleaseNULL(amw0);
     IOService::stop(provider);
 }
 
@@ -367,7 +443,7 @@ void G15Fan::free() {
 IOReturn G15Fan::setProperties(OSObject *props) {
     auto d = OSDynamicCast(OSDictionary, props);
     if (!d) return kIOReturnBadArgument;
-    bool write = d->getObject("FanBoost") || d->getObject("Profile") || d->getObject("GMode");
+    bool write = d->getObject("FanBoost") || d->getObject("Profile") || d->getObject("GMode") || d->getObject("KbdTimeout");
     // escrita: usuario da sessao grafica (o agente g15kbd) ou root. kIOClientPrivilegeAdministrator sozinho so aceita root.
     if (write && IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
         IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
@@ -390,6 +466,9 @@ IOReturn G15Fan::setProperties(OSObject *props) {
     if (auto b = OSDynamicCast(OSBoolean, d->getObject("GMode"))) {
         uint8_t back = lastProfile ? lastProfile : (nprofiles ? profiles[0] : 0);
         if (!activate(b->isTrue() ? GMODE : back)) ret = kIOReturnError;
+    }
+    if (auto n = OSDynamicCast(OSNumber, d->getObject("KbdTimeout"))) {
+        if (!kbdTimeoutWrite(n->unsigned32BitValue())) ret = kIOReturnError;
     }
     refresh();                                         // tambem atende {"Refresh": ...}
     IOLockUnlock(lock);

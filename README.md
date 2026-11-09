@@ -44,6 +44,13 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 - **Connectivity:** Wi-Fi (AirportItlwm), Bluetooth, Ethernet (RTL8111) and USB.
 - **Input:** keyboard via VoodooPS2, touchpad via VoodooI2C in GPIO interrupt mode, keyboard backlight (AW-ELC), and the
   Fn keys F5 / F9 / F10 through G15.app.
+- **Keyboard lighting (G15.app → "Luz do teclado…"):** a window with a drawing of the keyboard and a live preview.
+  - One color for the whole keyboard, or 4 zones (left, center, right, numpad).
+  - Effects from the AW-ELC controller: static, breathing, morph, spectrum and wave, with speed.
+  - Brightness, presets, and named profiles of your own.
+  - "Turn off after": the BIOS backlight timeout, set through `G15Fan` (Dell SMBIOS class 4/11 via `\_SB.AMW0.WMBA`).
+  - Nothing is written to the controller's flash; G15.app re-applies your choice at login and on wake.
+  - The protocol can be tested from Linux with `tools/test-kbd-elc.py`.
 - **Power and thermals:**
   - Battery status and charging.
   - CPU power management with HWP and full turbo (4.2-4.6 GHz single core), the C8/C10 idle table, and EPP per
