@@ -81,6 +81,20 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 - **Not tested:** the headphone jack, HDMI audio, USB-C video, the card reader, iMessage/FaceTime, FileVault,
   Sidecar, AirDrop and Handoff.
 
+## Will it work on my G15?
+
+| Your machine | Expected |
+|---|---|
+| G15 5530, i5-13450HX, RTX 4050, FHD 120 Hz, BIOS 1.0 | Same as mine (this is the tested machine) |
+| Other BIOS version | Probably boots, but `DSDT.aml` is from BIOS 1.0: rebuild it from your own dump (see step 3 below) |
+| i7-13650HX / i9-13900HX (other UHD device ID) | **Untested.** The WhateverXe fork's RPL-S GGTT fix is gated on A78B; another user with a 13650HX had no acceleration ([WhateverXe#51](https://github.com/b00t0x/WhateverXe/issues/51)) |
+| RTX 4060 | Untested; NullMoth supports it in general |
+| 165 Hz or QHD panel | Untested |
+| G15 5535 (AMD) / 5520 / 5511 | **No.** Different platform |
+
+The touchpad wake uses a hard-coded GPIO pad (GPP_E3); on another touchpad wiring it would not wake (everything else
+still works).
+
 ## BIOS settings
 
 - Secure Boot **off**.
@@ -88,27 +102,48 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 - **Hybrid Graphics ON** (Video > Enable Hybrid Graphics / Advanced Optimus), so the internal panel stays on the UHD.
   Without it the panel is on the RTX, and this EFI is not set up for that.
 
-## Before you boot
+## Install from scratch
 
-1. **Generate your own SMBIOS** for `MacBookPro16,1`, for example with
-   [GenSMBIOS](https://github.com/corpnewt/GenSMBIOS). Fill `SystemSerialNumber`, `MLB`, `SystemUUID` and `ROM` in
-   `PlatformInfo > Generic`; they are blank here.
-2. **`ACPI/DSDT.aml` is a full patched DSDT from my BIOS.** The patches are `_OSI` -> `XOSI` for the brightness keys,
-   and no `_S3`. If your BIOS version differs, dump your own DSDT and apply the same changes, or remove `DSDT.aml`
-   from `ACPI > Add` and accept what breaks.
-3. **The boot-args are my diagnostic set:**
-   ```
-   -v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -allow3d -disablegfxfirmware
-   amfi_get_out_of_my_way=1 gfxrst=1 -g15pm -igfxdvmt -wexdbg wexblmin=4900 -wex-blmin=4900 nvfb=1 nvaccel=1 acpi=0xC
-   ```
-   - Required: `-allow3d -disablegfxfirmware amfi_get_out_of_my_way=1 -igfxdvmt gfxrst=1 -g15pm wexblmin=4900
-     -wex-blmin=4900 nvfb=1 nvaccel=1`.
-   - Logging only, safe to remove: `-v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -wexdbg acpi=0xC`.
-4. **SIP** is partly disabled (`csr-active-config` 0x0A43), and AMFI is relaxed: the GPU bundles are re-signed ad hoc.
-   Know what that means for your security.
+1. **Make the USB installer.**
+   - Download macOS Tahoe recovery with `macrecovery.py` from the
+     [OpenCorePkg](https://github.com/acidanthera/OpenCorePkg/releases) `Utilities` folder (or make a full installer
+     USB on a real Mac).
+   - Format the USB stick as FAT32 / GPT ([Dortania guide](https://dortania.github.io/OpenCore-Install-Guide/installer-guide/)).
+   - Copy this `EFI` folder to it.
+2. **Use the installer config.** On the USB stick, rename `EFI/OC/config.plist` to `config-system.plist`, and
+   `EFI/OC/config-install.plist` to `config.plist`. The installer config is the one I installed with:
+   - WhateverGreen with `-wegnoegpu` and no WhateverXe, so there is no iGPU acceleration during setup.
+   - Touchpad in polling mode; Wi-Fi, keyboard and USB work.
+3. **SMBIOS.** Generate a `MacBookPro16,1` serial with [GenSMBIOS](https://github.com/corpnewt/GenSMBIOS). Put the
+   **same** `SystemSerialNumber`, `MLB`, `SystemUUID` and `ROM` in both configs, under `PlatformInfo > Generic`.
+4. **`ACPI/DSDT.aml` is a full patched DSDT from my BIOS 1.0.** The patches are `_OSI` -> `XOSI` (brightness keys)
+   and the `_S3` removal. On another BIOS version, dump your own DSDT (for example from Linux,
+   `sudo cat /sys/firmware/acpi/tables/DSDT > DSDT.aml`) and apply the same two changes. Or remove `DSDT.aml` from
+   `ACPI > Add`, and accept that brightness keys and sleep may break.
+5. **Install macOS** from the USB stick (F12 boot menu), then boot the new install through the USB stick.
+6. **Copy the EFI to the SSD.** Mount the SSD's EFI partition and copy the EFI folder there, this time with the
+   **system** `config.plist` (and your SMBIOS). Boot from the SSD.
+7. **Install the WhateverXe Graphics package 0.4.0**
+   ([releases](https://github.com/b00t0x/WhateverXe-Graphics/releases)) and reboot. The UHD is now accelerated.
+8. **Run the post-install script** (next section), then install NullMoth.
+
+### Boot-args of the system config
+
+```
+-v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -allow3d -disablegfxfirmware
+amfi_get_out_of_my_way=1 gfxrst=1 -g15pm -igfxdvmt -wexdbg wexblmin=4900 -wex-blmin=4900 nvfb=1 nvaccel=1 acpi=0xC
+```
+
+- Required: `-allow3d -disablegfxfirmware amfi_get_out_of_my_way=1 -igfxdvmt gfxrst=1 -g15pm wexblmin=4900
+  -wex-blmin=4900 nvfb=1 nvaccel=1`.
+- Logging only, safe to remove: `-v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -wexdbg acpi=0xC`.
+
+SIP is partly disabled (`csr-active-config` 0x0A43) and AMFI is relaxed, because the GPU bundles are re-signed ad hoc.
+Know what that means for your security.
 
 ## EFI contents
 
+- `EFI/OC/config.plist`: the system config. `EFI/OC/config-install.plist`: the installer config (see Install from scratch).
 - `EFI/OC/ACPI` (sources in `acpi-src/`; the comments are in Portuguese):
   - `SSDT-AWAC`, `SSDT-EC-USBX`, `SSDT-PLUG-ALT` (from Dortania) and `SSDT-PNLF` (prebuilt).
   - `SSDT-XOSI`: answers the Windows `_OSI` strings on macOS.
@@ -122,6 +157,7 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - USBToolBox 1.2.0 + UTBDefault, XHCI-unsupported.
   - VoodooPS2Controller 2.3.8, VoodooI2C 2.9.1 (CI build 6be653a2) + VoodooI2CHID, BrightnessKeys 1.0.4.
   - AMFIPass-Mod 1.4.1.
+  - WhateverGreen 1.7.2: used only by `config-install.plist`; the system config does not load it.
   - **My builds:**
     - `WhateverXe` (fork above).
     - `G15Fan`: fans and profiles via Dell WMAX, RTX power cut in sleep, EC wake arming.
@@ -133,28 +169,43 @@ NullMoth (the RTX driver) is not in the EFI. Its installer puts it in `/Library/
 
 ## Post-install (in macOS)
 
-1. **WhateverXe Graphics 0.4.0** package (0.4.1 is untested here).
-2. **Metal driver memory leak fix:** run `post-install/macos-mtl-leakpatch.sh aplicar`, then reboot.
-   - The patch changes the TGL Metal driver at `0x7ed87`, `75 0d` -> `90 90`
+Run it after the WhateverXe Graphics package, from this repository's folder:
+
+```
+sudo bash install-macos.sh check      # shows what is installed, changes nothing
+sudo bash install-macos.sh install    # applies everything, then reboot
+```
+
+It runs these steps, which are also separate scripts. Every patched file is backed up to `/Library/G15-uhd`, and
+every binary patch checks its bytes first, so it stops on a different driver version.
+
+1. **Metal driver memory leak fix** (`post-install/macos-mtl-leakpatch.sh`).
+   - Patches the TGL Metal driver at `0x7ed87`, `75 0d` -> `90 90`
      ([WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)).
    - Without it, WindowServer grows by hundreds of MB per minute.
-3. **VA driver patches:** run `post-install/macos-patch-wex-va.sh avcfix`.
-   - This fixes H.264 hardware decode on Tahoe (key 6 of `SetParam`).
-   - The `avcfix-vame-k7` mode also needs the Tiger Lake VAME bundle for FairPlay. It is not included because it is an
-     Apple binary.
-4. **Metal shim `stencilfix`:** run `src/stencilfix/instalar.sh`. It fixes wrong stencil reads (white blocks in 3D
-   apps).
-5. **NullMoth 2.8.1** from its installer, with HDMI audio (NMXAudio). Then add `BOOST=0` to
-   `/Library/GPUBundles/nvmtl/nvrm610.conf`.
-6. **Audio plug-in XeSpeakers** with DeepFilterNet3: see `src/AudShim/XeSpeakers`.
-7. **G15.app:** build it with `src/G15.app/build.sh`. It handles the Fn keys, keyboard light, profiles, fans,
-   temperatures and permission prompts.
-8. **pmset (my values):**
-   - Battery: `displaysleep 3`, `sleep 5`.
-   - AC: `displaysleep 5`, `sleep 15`.
-   - `hibernatemode 0`, `standby 0`.
+2. **VA driver patches, `avcfix` mode** (`post-install/macos-patch-wex-va.sh`).
+   - Fixes H.264 hardware decode on Tahoe (key 6 of `SetParam`), plus two NULL checks.
+   - My machine uses the `avcfix-vame-k7` mode, which adds FairPlay (Apple Music). That mode needs the Tiger Lake VAME
+     bundle, an Apple binary that is not included here.
+3. **Metal shim `stencilfix`** (`prebuilt/stencilfix`). Fixes wrong stencil reads, the white blocks in 3D apps.
+4. **Audio HAL plug-in XeSpeakers** with DeepFilterNet3 (`prebuilt/audio`). It creates the "Alto-falantes internos"
+   (speakers) and "Microfone interno" (microphone) devices.
+   - The DSP firmware (Linux SOF `sof-rpl-s.ri`) is built into `AudShim.kext`.
+5. **G15.app** for your user (`prebuilt/G15.app-installer`).
+   - It handles the Fn keys, keyboard light, profiles and fans, menu-bar temperatures and permission prompts.
+   - Its menus are in Portuguese. It needs the `G15Fan` and `G15PM` kexts (in the EFI).
+6. **pmset:** battery display 3 min / sleep 5 min, AC display 5 min / sleep 15 min, `hibernatemode 0`, `standby 0`.
 
-Reinstalling the WhateverXe Graphics package undoes steps 2-4, so run them again afterwards.
+Then do two things by hand:
+- Install **NullMoth 2.8.1** with its own installer.
+- Add `BOOST=0` to `/Library/GPUBundles/nvmtl/nvrm610.conf` so the RTX idles at P8.
+
+**Reinstalling the WhateverXe Graphics package undoes steps 1-3.** Run `install-macos.sh install` again afterwards.
+
+Sources for everything in `prebuilt/` are in `src/`. To rebuild:
+- `src/G15.app/build.sh`
+- `src/AudShim/XeSpeakers/build.sh`
+- `src/stencilfix/build-mac.sh`
 
 ## Credits
 
