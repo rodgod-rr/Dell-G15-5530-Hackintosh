@@ -314,7 +314,10 @@ static int profileFanBoost(int p) {
 typedef struct { int state, temp, util; } RtxInfo;
 static RtxInfo rtxInfo(NSDictionary *st) {
     RtxInfo r = {0, -1, 0};
-    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    // (10/11) RTX parada pelo G15Fan (RtxPm, "imitar o repouso"): o NVAccel continua no registro com a ultima leitura
+    // congelada; vale o estado desligado e a temperatura do sensor 0x06 do EC (le a placa mesmo sem energia nela).
+    BOOL parked = [st[@"RtxParked"] boolValue];
+    io_service_t sv = parked ? 0 : IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
     if (sv) {
         NSDictionary *ps = CFBridgingRelease(IORegistryEntryCreateCFProperty(sv, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0));
         IOObjectRelease(sv);
@@ -468,6 +471,50 @@ static void profileStep(void) {                    // Fn+F9: proximo perfil
             100.0 * (k + 1) / ring.count);
 }
 
+// ---------- RTX automatica (G15Fan RtxPm, 10/11) ----------
+// Sem nenhum programa na RTX (clientes do NVAccel) e sem monitor externo por 30 s na bateria ou 3 min na tomada, para a
+// RTX (NVRM e audio HDMI no estado 0; com -g15fan-rtxpm-corte o G15Fan corta a energia). Ao conectar o carregador:
+// religa (e ela volta a parar depois de 3 min ociosa). Parada, a RTX nao ve o cabo HDMI: modo "Ligada" antes. Modo no menu (seletor RTX), preferencia local.g15 "rtxMode".
+static int rtxIdleTicks;
+// modo (preferencia "rtxMode"): 0 desligada (para sempre que ociosa 30 s; um programa que a pedir ainda a religa),
+// 1 ligada (nunca para), 2 automatica (ociosa: 30 s na bateria, 3 min na tomada; religa no carregador)
+static int rtxMode(void) { id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rtxMode"]; return v ? MAX(0, MIN(2, [v intValue])) : 2; }
+static int rtxClients(void) {                      // conexoes abertas no NVAccel (Metal/OpenCL de algum programa)
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!sv) return 0;
+    io_iterator_t it = 0; int n = 0;
+    if (IORegistryEntryGetChildIterator(sv, kIOServicePlane, &it) == KERN_SUCCESS) {
+        io_object_t c;
+        while ((c = IOIteratorNext(it))) { if (IOObjectConformsTo(c, "IOUserClient")) n++; IOObjectRelease(c); }
+        IOObjectRelease(it);
+    }
+    IOObjectRelease(sv);
+    return n;
+}
+static BOOL rtxExternal(void) {                    // mais de uma tela ligada (espelhada conta)
+    uint32_t n = 0; CGGetOnlineDisplayList(0, NULL, &n);
+    return n > 1;
+}
+static BOOL rtxSet(BOOL on, const char *why) {
+    kern_return_t r = fanWrite(@{@"RtxPm": on ? @1 : @2});
+    NSLog(@"RTX %s (%s): %s", on ? "ligar" : "parar", why, r == KERN_SUCCESS ? "ok" : "erro");
+    rtxIdleTicks = 0;
+    return r == KERN_SUCCESS;
+}
+static void rtxTick(NSDictionary *st, int ac) {    // a cada 5 s
+    int mode = rtxMode();
+    if (!st || mode == 1 || (mode == 2 && ac < 0) || !st[@"RtxParked"] || [st[@"RtxParked"] boolValue]) { rtxIdleTicks = 0; return; }
+    if (rtxClients() || rtxExternal()) { rtxIdleTicks = 0; return; }
+    if (mode == 0) { if (++rtxIdleTicks >= 6) rtxSet(NO, "modo desligada, ociosa 30 s"); return; }
+    if (++rtxIdleTicks >= (ac ? 36 : 6)) rtxSet(NO, ac ? "tomada, ociosa 3 min" : "bateria, ociosa 30 s");
+}
+static void rtxPower(int ac) {                     // carregador mudou
+    rtxIdleTicks = 0;
+    if (ac != 1 || rtxMode() != 2) return;
+    NSDictionary *st = fanState(NO);
+    if ([st[@"RtxParked"] boolValue]) rtxSet(YES, "carregador conectado");
+}
+
 // carregador: desconectado -> Bateria (0xA5), conectado -> Balanceado (0xA0); ao abrir (login) ja na bateria -> Bateria
 static int acLast = -1;
 static int onAC(void) {
@@ -483,6 +530,7 @@ static void acChanged(void *ctx) {
     int ac = onAC();
     if (ac < 0 || ac == acLast) return;
     BOOL first = acLast < 0; acLast = ac;
+    rtxPower(ac);
     if (first && ac) return;                       // abriu na tomada: mantem o perfil; abriu na bateria: vai para Bateria
     int p = ac ? 0xA0 : 0xA5;
     NSLog(@"carregador %s: perfil 0x%02x", ac ? "conectado" : "desconectado", p);
@@ -1105,6 +1153,7 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
     lidEvent(readLid(), "tick");
     if (asleep) return;
     NSDictionary *st = fanState(YES);
+    rtxTick(st, onAC());
     [self updateTitle:st];
     if (!st) return;
     int t = MAX(fanTemp(st, @"0x01"), fanTemp(st, @"0x06")), b = fanBoost(st);
@@ -1149,6 +1198,21 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
         for (NSNumber *p in profileRing(st))
             [self add:pm title:profileName(p.intValue) action:@selector(setProfile:) tag:p.intValue on:p.intValue == cur];
         [menu addItemWithTitle:[L("Perfil: ", "Profile: ") stringByAppendingString:profileName(cur)] action:nil keyEquivalent:@""].submenu = pm;
+
+        if (st[@"RtxParked"]) {                     // G15Fan com RtxPm: seletor RTX ( Desligada | Ligada | Automática )
+            [menu addItem:NSMenuItem.separatorItem];
+            NSMenuItem *ri = [NSMenuItem new];
+            NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 30)];
+            NSTextField *lb = [NSTextField labelWithString:@"RTX"];
+            lb.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]; lb.frame = NSMakeRect(16, 6, 36, 18);
+            NSSegmentedControl *sc = [NSSegmentedControl segmentedControlWithLabels:@[L("Desligada", "Off"), L("Ligada", "On"), L("Automática", "Auto")]
+                                                                    trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(rtxMode:)];
+            sc.frame = NSMakeRect(52, 3, 236, 24); sc.controlSize = NSControlSizeSmall; sc.font = [NSFont systemFontOfSize:11];
+            sc.selectedSegment = rtxMode();
+            sc.toolTip = [st[@"RtxParked"] boolValue] ? L("Agora: desligada", "Now: off") : L("Agora: ligada", "Now: on");
+            [v addSubview:lb]; [v addSubview:sc];
+            ri.view = v; [menu addItem:ri];
+        }
     }
 
     {   // luz do teclado: abre a janela (cores, zonas, efeitos, perfis); o Fn+F5 continua no brilho
@@ -1208,6 +1272,19 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 }
 - (void)nsSave:(NSNumber *)db { nsSetAtten(db.intValue); }
 - (void)setFan:(NSMenuItem *)i { setBoost((int)i.tag); }
+- (void)rtxMode:(NSSegmentedControl *)sc {
+    int m = (int)sc.selectedSegment;
+    [[NSUserDefaults standardUserDefaults] setInteger:m forKey:@"rtxMode"];
+    rtxIdleTicks = 0;
+    BOOL parked = [fanState(NO)[@"RtxParked"] boolValue];
+    NSLog(@"RTX: modo %d", m);
+    if (m == 1 && parked) rtxSet(YES, "modo ligada");
+    else if (m == 0 && !parked) {
+        if (rtxClients() || rtxExternal())
+            notify(@"RTX", L("Em uso (programa ou monitor externo): desliga quando ficar ociosa.", "In use (app or external display): turns off when idle."));
+        else rtxSet(NO, "modo desligada");
+    }
+}
 - (void)setProfile:(NSMenuItem *)i { applyProfile((int)i.tag); }
 - (void)openKb:(id)s { kbWindowOpen(); }
 - (void)openLog:(id)s {

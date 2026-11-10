@@ -26,13 +26,31 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
     [rodgod-rr/WhateverXe `g15-deep-idle`](https://github.com/rodgod-rr/WhateverXe/tree/g15-deep-idle)
     ([write-up](https://github.com/rodgod-rr/WhateverXe/blob/g15-deep-idle/docs/g15-deep-idle/README.md)).
   - It needs the [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics) **0.4.0** package.
-- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 2.8.1. It runs
+- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 2.9. It runs
   alongside the UHD: Metal 3, about 4.9 TFLOPS.
+- **RTX powered off when idle (since 2026-11-10).** NullMoth 2.9's own RTD3 cannot cut power here (Apple's
+  `evaluateObject` only runs plain method names, and forcing it froze the system). Instead, the RTX goes through the
+  same path as system sleep, while the system stays awake:
+  - `G15Fan` asks IOPM to put NVRM and the HDMI audio function in power state 0. NullMoth then suspends the GPU with
+    its own sleep code.
+  - When the PCIe bridge reaches state 0, `G15Fan` calls `GOFF` (`PG01._OFF`). This needs the boot-arg
+    `-g15fan-rtxpm-corte`.
+  - Turning it back on calls `GONN`, and NullMoth resumes in about 1.2 s.
+  - `G15PM` hooks `NVAccel::newUserClient`, so an app that opens the RTX turns it back on first and waits for it.
+  - G15.app has an "RTX ( Desligada | Ligada | Automática )" selector (off / on / auto). Auto turns the RTX off after
+    30 s idle on battery or 3 min on AC, and back on when the charger is plugged in. The menu bar shows "RTX" in red
+    when it is off, with the temperature from the EC sensor.
+  - Idle on battery: about 24-29 W, against about 34 W with the RTX on.
+  - Apps reach the RTX only if listed in `/Library/GPUBundles/nvmtl-allow.txt`. Use
+    `tools/rtx/macos-rtx-allow.sh restrita [app ...]`; NullMoth's default `*` keeps it busy.
+  - While it is off, the RTX cannot see an HDMI cable. Pick "Ligada" before connecting one.
 - **Sleep (Deep Idle / S0, since the firmware has no S3).** Sleep and wake work, and the panel comes back every time.
   - Tested with 5 RTC cycles in a row, idle sleep, lid-close sleep, and 1 h 44 min on battery.
   - **Wake sources:** lid, internal keyboard, touchpad, power button, USB.
   - The fix needs three pieces: my WhateverXe fork, `SSDT-DeepIdle` and `SSDT-LIDWAKE`.
   - The RTX is powered off during sleep by `G15Fan` + `SSDT-RTXKEXT` (ACPI `PG01._OFF`).
+  - Display sleep without system sleep also works: the panel comes back. The WhateverXe fork turns the CDCLK PLL
+    back on after a long display Doze ([WhateverXe#80](https://github.com/b00t0x/WhateverXe/issues/80)).
 - **Video:**
   - H.264 and HEVC hardware decode (YouTube 1080p H.264 in Safari).
   - H.264 hardware encode.
@@ -61,10 +79,11 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 
 ## What partly works
 
-- **HDMI (wired to the RTX):** it works only if the cable is connected at boot, in extended mode. Mirroring corrupts
-  one screen, and hotplug does not work. Last tested with NullMoth 2.6.0; not re-tested on 2.8.1.
-- **RTX idle power:** the RTX never powers off at runtime, because NullMoth has no RTD3/GC6
-  ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
+- **HDMI (wired to the RTX):** with NullMoth 2.9, a cable connected at boot works in extended and mirrored mode, and
+  resolution changes work. Hotplug is unreliable; a workaround is described in
+  [nullmoth#288](https://github.com/nullmoth/nvidia-macos-driver/issues/288).
+- **RTX idle power:** solved since 2026-11-10 by `G15Fan` + `G15PM` (see "What works"). NullMoth's own RTD3/GC6 still
+  cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
 - **Power draw while asleep is about 19 W.** In October, with the iGPU still unaccelerated, I measured about 3-5 W.
@@ -137,13 +156,14 @@ still works).
 ### Boot-args of the system config
 
 ```
--v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -allow3d -disablegfxfirmware
+keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -allow3d -disablegfxfirmware
 amfi_get_out_of_my_way=1 gfxrst=1 -g15pm -igfxdvmt -wexdbg wexblmin=4900 -wex-blmin=4900 nvfb=1 nvaccel=1 acpi=0xC
+-g15fan-rtxpm-corte
 ```
 
 - Required: `-allow3d -disablegfxfirmware amfi_get_out_of_my_way=1 -igfxdvmt gfxrst=1 -g15pm wexblmin=4900
   -wex-blmin=4900 nvfb=1 nvaccel=1`.
-- Logging only, safe to remove: `-v keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -wexdbg acpi=0xC`.
+- Logging only, safe to remove (add `-v` for a verbose boot): `keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -wexdbg acpi=0xC`.
 
 SIP is partly disabled (`csr-active-config` 0x0A43) and AMFI is relaxed, because the GPU bundles are re-signed ad hoc.
 Know what that means for your security.
@@ -204,7 +224,9 @@ every binary patch checks its bytes first, so it stops on a different driver ver
 6. **pmset:** battery display 3 min / sleep 5 min, AC display 5 min / sleep 15 min, `hibernatemode 0`, `standby 0`.
 
 Then do two things by hand:
-- Install **NullMoth 2.8.1** with its own installer.
+- Install **NullMoth 2.9** with its own installer. Then restrict the RTX to the apps that need it:
+  `sudo bash tools/rtx/macos-rtx-allow.sh restrita [app ...]`. Run this again after every NullMoth update, because the
+  update resets the list.
 - Add `BOOST=0` to `/Library/GPUBundles/nvmtl/nvrm610.conf` so the RTX idles at P8.
 
 **Reinstalling the WhateverXe Graphics package undoes steps 1-3.** Run `install-macos.sh install` again afterwards.

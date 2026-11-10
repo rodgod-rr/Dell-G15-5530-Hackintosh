@@ -71,6 +71,11 @@ class G15Fan : public IOService {
     bool pepIn {false};                               // avisos de entrada no Modern Standby dados, falta a saida
     bool pepOff {false};                              // boot-arg -g15fan-pep-off
     uint32_t pep[8] {};                               // entradas, saidas, ultimo resultado das funcoes 3, 5, 6, 4
+    bool rtxIdle {false};                             // "imitar o repouso": NVRM (e audio) pedidos para o estado 0
+    bool rtxIdleCut {false};                          // boot-arg -g15fan-rtxpm-corte: GOFF quando o PEG1 chega a 0
+    uint32_t rp[6] {};                                // pedidos ->0, pedidos ->1, PEG1 ->0 fora do sono, GOFF, servicos achados, ultimo modo
+    int rtxPm(uint32_t mode);
+    void publishRtxPm();
 
     static IOReturn sleepWake(void *target, void *ref, UInt32 msg, IOService *prov, void *arg, vm_size_t argSize);
     static bool pciPublished(void *target, void *ref, IOService *dev, IONotifier *n);
@@ -97,6 +102,7 @@ public:
     void stop(IOService *provider) override;
     void free() override;
     IOReturn setProperties(OSObject *props) override;
+    IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
     IOReturn powerStateDidChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *who) override;
     IOReturn powerStateWillChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *who) override;
 };
@@ -317,7 +323,9 @@ IOReturn G15Fan::sleepWake(void *target, void *, UInt32 msg, IOService *, void *
         self->pepNotify(true);
     } else if (msg == kIOMessageSystemWillPowerOn) { // antes do GFX0/NVRM acordarem: religa a RTX
         self->hk[1]++;
-        if (self->hasRtx && !self->rtxBootOff) self->callRtx("GONN", 5);
+        // RtxPm parada (10/11): o NVRM continua no estado 0 depois do sono, entao a RTX fica cortada; religar aqui a
+        // deixava ligada sem driver. Quem religa e o "ligar" (GONN no powerStateWillChangeTo do PEG1).
+        if (self->hasRtx && !self->rtxBootOff && !self->rtxIdle) self->callRtx("GONN", 5);
         self->systemSleeping = false;
         self->pepNotify(false);
         self->armWake(0);
@@ -332,7 +340,11 @@ IOReturn G15Fan::powerStateDidChangeTo(IOPMPowerFlags, unsigned long state, IOSe
     if (who == peg1 && state == 0 && systemSleeping) {   // PEG1 desligado no sono: o NVRM ja parou a RTX
         hk[2]++;
         callRtx("GOFF", 4);
-    }
+    } else if (who == peg1 && state == 0 && rtxIdle) {   // "imitar o repouso" (RtxPm): mesmo caminho fora do sono
+        rp[2]++;
+        if (rtxIdleCut && !rtxBootOff) { rp[3]++; callRtx("GOFF", 4); }
+        publishRtxPm();
+    } else if (who == peg1 && rtxIdle) publishRtxPm();
     return IOPMAckImplied;
 }
 
@@ -358,6 +370,7 @@ bool G15Fan::pciPublished(void *target, void *, IOService *dev, IONotifier *) {
     IOPMPowerFlags f = dev->registerInterestedDriver(self);
     LOG("PEG1 %s: interessado no estado de energia (flags 0x%lx)", path->getCStringNoCopy(), (unsigned long)f);
     self->publishHooks();
+    self->publishRtxPm();                              // "RtxParked" = false desde o boot (o G15.app ve que ha RtxPm)
     return true;
 }
 
@@ -379,6 +392,34 @@ IOService *G15Fan::probe(IOService *provider, SInt32 *score) {
     auto dev = OSDynamicCast(IOACPIPlatformDevice, provider);
     if (!dev || dev->validateObject("WMAX") != kIOReturnSuccess) return nullptr;   // so o AMWW tem WMAX
     return IOService::probe(provider, score);
+}
+
+// Diagnostico do RTD3 da NullMoth 2.9 (10/11): o NVRM sobe pelos provedores da RTX ate o PC00 e roda
+// "\_SB.PC00.PEG1.PG01._OFF" pelo caminho completo; volta 0xe00002c2. Aqui so LEITURA: o _STA do mesmo recurso por
+// caminho completo e relativo, a partir do PC00, do PEG1 e do nosso AMWW, e o validateObject do _OFF. Registro "RTD3Probe".
+static void g15Rtd3Probe(IOService *self, IOACPIPlatformDevice *own) {
+    auto pc00 = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath("IOACPIPlane:/_SB/PC00"));
+    auto peg1 = OSDynamicCast(IOACPIPlatformDevice, IORegistryEntry::fromPath("IOACPIPlane:/_SB/PC00/PEG1@10000"));
+    char b[640]; int n = 0; UInt32 v;
+    auto t = [&](const char *tag, IOACPIPlatformDevice *d, const char *name) {
+        if (!d) { n += snprintf(b + n, sizeof b - n, "%s=sem-no ", tag); return; }
+        v = 0xFFFFFFFF; IOReturn r = d->evaluateInteger(name, &v);
+        n += snprintf(b + n, sizeof b - n, "%s=0x%x/%u ", tag, r, v);
+    };
+    t("pc00_abs", pc00, "\\_SB.PC00.PEG1.PG01._STA");
+    t("amww_abs", own, "\\_SB.PC00.PEG1.PG01._STA");
+    t("peg1_rel", peg1, "PG01._STA");
+    t("pc00_rel", pc00, "PEG1.PG01._STA");
+    t("pc00_abs_noslash", pc00, "_SB.PC00.PEG1.PG01._STA");
+    // controle (10/11): o GSLP do nosso AMWW funciona pelo nome simples; pelo caminho com pontos?
+    t("amww_gslp", own, "GSLP");
+    t("amww_gslp_abs", own, "\\_SB.AMWW.GSLP");
+    t("pc00_gslp_abs", pc00, "\\_SB.AMWW.GSLP");
+    if (pc00) n += snprintf(b + n, sizeof b - n, "pc00_val_off=0x%x peg1_val_off=0x%x",
+        pc00->validateObject("\\_SB.PC00.PEG1.PG01._OFF"), peg1 ? peg1->validateObject("PG01._OFF") : 0xdead);
+    self->setProperty("RTD3Probe", b);
+    IOLog("G15Fan: RTD3Probe %s\n", b);
+    OSSafeReleaseNULL(pc00); OSSafeReleaseNULL(peg1);
 }
 
 bool G15Fan::start(IOService *provider) {
@@ -409,7 +450,9 @@ bool G15Fan::start(IOService *provider) {
         LOG("SMBIOS (AMW0.WMBA): %s", amw0 ? (kt ? "tempo da luz lido" : "sem resposta") : "nao achado");
     }
     registerService();
+    { char pb[4]; if (PE_parse_boot_argn("-g15fan-rtd3probe", pb, sizeof pb)) g15Rtd3Probe(this, acpi); }   // diagnostico do RTD3
     { char b[4]; pepOff = PE_parse_boot_argn("-g15fan-pep-off", b, sizeof b); }   // sem os avisos de Modern Standby
+    { char b[4]; rtxIdleCut = PE_parse_boot_argn("-g15fan-rtxpm-corte", b, sizeof b); }   // RtxPm com GOFF
     sleepNotifier = registerPrioritySleepWakeInterest(sleepWake, this);   // sempre (armar o EC); a RTX so com o SSDT
     if (acpi->validateObject("GOFF") == kIOReturnSuccess && acpi->validateObject("GONN") == kIOReturnSuccess) {
         hasRtx = true;
@@ -440,6 +483,86 @@ void G15Fan::free() {
     IOService::free();
 }
 
+// 10/11/2026 "imitar o repouso": no sono o IOPM leva o NVRM ao estado 0 (gpuSuspend da NullMoth: para canais, salva o
+// PCI, RM STANDBY), o IOPCIFamily desce PEGP/fn1/ponte e o G15Fan chama o GOFF quando o PEG1 chega a 0. Aqui o mesmo
+// pedido e feito com o sistema acordado: changePowerStateTo(0) no NVRM (e, no modo 2, no NMXAudioDevice/NMXAudio, que
+// seguram a funcao 1 = audio HDMI). Modo 1 devolve tudo ao estado 1 (o GONN sai do powerStateWillChangeTo do PEG1, se
+// o GOFF tiver rodado). Sem -g15fan-rtxpm-corte o GOFF nao e chamado: so mede ate onde a arvore desce.
+// Propriedade "RtxPm": pedidos, estados atuais (PEG1 PEGP fn1 NVRM) e contadores. "RtxParked" (bool): pedido de parada
+// em vigor (o G15.app usa com o bit 0x10000 do SleepDebug = energia cortada). Escrita: root ou o usuario da sessao.
+static IOService *findOne(const char *cls) {
+    auto m = IOService::serviceMatching(cls);
+    auto it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    auto s = it ? OSDynamicCast(IOService, it->getNextObject()) : nullptr;
+    if (s) s->retain();
+    OSSafeReleaseNULL(it);
+    return s;
+}
+
+static IOService *pmParent(IOService *s) {         // pai no plano de energia (pula o IOPowerConnection)
+    auto c = s ? s->getParentEntry(gIOPowerPlane) : nullptr;
+    return c ? OSDynamicCast(IOService, c->getParentEntry(gIOPowerPlane)) : nullptr;
+}
+
+void G15Fan::publishRtxPm() {
+    auto nv = findOne("NVRM");
+    auto pegp = pmParent(nv);
+    auto aud = findOne("NMXAudioDevice");
+    auto fn1 = pmParent(aud);
+    char b[200];
+    snprintf(b, sizeof b, "%s; estados PEG1 %ld PEGP %ld fn1 %ld NVRM %ld; pedidos ->0 %u ->1 %u; PEG1 ->0 %u; GOFF %u; achados 0x%x; modo %u%s",
+             rtxIdle ? "parada" : "normal", peg1 ? (long)peg1->getPowerState() : -1L, pegp ? (long)pegp->getPowerState() : -1L,
+             fn1 ? (long)fn1->getPowerState() : -1L, nv ? (long)nv->getPowerState() : -1L,
+             rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rtxIdleCut ? "; corte ligado" : "; sem corte (seco)");
+    setProperty("RtxPm", b);
+    setProperty("RtxParked", rtxIdle);
+    OSSafeReleaseNULL(nv); OSSafeReleaseNULL(aud);
+}
+
+int G15Fan::rtxPm(uint32_t mode) {                    // 0 NVRM ->0; 2 NVRM e audio ->0; 1 tudo ->1
+    if (mode > 2) return kIOReturnBadArgument;
+    const char *cls[] {"NVRM", "NMXAudioDevice", "NMXAudio"};
+    unsigned n = mode == 0 ? 1 : 3;
+    uint32_t found = 0;
+    // 10/11: depois de um sono com a RTX parada o IOPCIFamily acorda a ponte (PEG1 em 2) mas a RTX continua cortada, e
+    // o PEG1 nao passa mais pelo powerStateWillChangeTo (onde sai o GONN). Entao o "ligar" religa a energia aqui antes.
+    UInt32 sd = 0;
+    if (mode == 1 && hasRtx && !rtxBootOff && acpi->evaluateInteger("GSLP", &sd) == kIOReturnSuccess && (sd & 0x10000))
+        callRtx("GONN", 5);
+    for (unsigned i = 0; i < n; i++) {
+        auto s = findOne(cls[i]);
+        if (!s) continue;
+        found |= 1u << i;
+        IOReturn e = s->changePowerStateTo(mode == 1 ? 1 : 0);
+        LOG("RtxPm: %s changePowerStateTo(%u) = 0x%x", cls[i], mode == 1 ? 1 : 0, e);
+        s->release();
+    }
+    rp[4] = found; rp[5] = mode;
+    if (mode == 1) { rp[1]++; rtxIdle = false; } else { rp[0]++; rtxIdle = true; }
+    publishRtxPm();
+    return (found & 1) ? kIOReturnSuccess : kIOReturnNotFound;
+}
+
+// (10/11) Religar sob demanda: o G15PM intercepta a abertura de um cliente no NVAccel (programa pedindo a RTX) e chama
+// callPlatformFunction("G15RtxWake") aqui (entre kexts, sem ligacao direta). Com a RTX parada: RtxPm(1) (GONN e o
+// IOPM acorda NVRM/audio) e espera o NVRM chegar ao estado 1 (ate 8 s), para o programa so continuar com a GPU pronta.
+// p1 (opcional, uint32_t*): devolve o tempo de espera em ms (0xFFFFFFFF = nao acordou a tempo).
+IOReturn G15Fan::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) {
+    if (!name || !name->isEqualTo("G15RtxWake")) return IOService::callPlatformFunction(name, wait, p1, p2, p3, p4);
+    uint32_t ms = 0;
+    const bool was = rtxIdle;
+    if (was) rtxPm(1);
+    // espera tambem quando outro programa acabou de pedir (rtxIdle ja falso, NVRM ainda acordando)
+    auto nv = findOne("NVRM");
+    while (nv && nv->getPowerState() < 1 && ms < 8000) { IOSleep(50); ms += 50; }
+    if (nv && nv->getPowerState() < 1) ms = 0xFFFFFFFF;
+    OSSafeReleaseNULL(nv);
+    if (was) { LOG("RtxPm: religada sob demanda (%u ms)", ms); publishRtxPm(); }
+    if (p1) *static_cast<uint32_t *>(p1) = ms;
+    return kIOReturnSuccess;
+}
+
 IOReturn G15Fan::setProperties(OSObject *props) {
     auto d = OSDynamicCast(OSDictionary, props);
     if (!d) return kIOReturnBadArgument;
@@ -448,6 +571,12 @@ IOReturn G15Fan::setProperties(OSObject *props) {
     if (write && IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
         IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
         return kIOReturnNotPrivileged;
+    if (auto n = OSDynamicCast(OSNumber, d->getObject("RtxPm"))) {   // root ou o usuario da sessao grafica (G15.app)
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+            IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return rtxPm(n->unsigned32BitValue());
+    }
     IOReturn ret = kIOReturnSuccess;
     IOLockLock(lock);
     if (auto n = OSDynamicCast(OSNumber, d->getObject("FanBoost"))) {

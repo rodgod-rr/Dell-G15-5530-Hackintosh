@@ -3,6 +3,8 @@
 #include <Headers/kern_api.hpp>
 
 extern void xePmInstall(KernelPatcher &);
+extern void rtd3Install();
+extern void rtxWakeInstall();
 
 static const char *bootargOff[] {"-g15pmoff"};
 static const char *bootargDebug[] {"-g15pmdbg"};
@@ -19,5 +21,9 @@ PluginConfiguration ADDPR(config) {
 	0,
 	KernelVersion::Ventura,
 	KernelVersion::Tahoe,
-	[]() { lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { xePmInstall(patcher); }); },
+	[]() {
+		lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { xePmInstall(patcher); });
+		rtd3Install();
+		rtxWakeInstall();
+	},
 };
