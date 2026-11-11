@@ -8,7 +8,7 @@ SRC=$(cd "$(dirname "$0")" && pwd)
 [ "$SRC" = "$(pwd)" ] || cp "$SRC/G15.m" "$SRC/mkicon.m" .
 A=G15.app; mkdir -p $A/Contents/MacOS $A/Contents/Resources
 clang -fobjc-arc -O2 -Wall -arch x86_64 -mmacosx-version-min=13.0 \
-  -framework AppKit -framework Carbon -framework IOKit -framework UserNotifications G15.m -o $A/Contents/MacOS/G15
+  -framework AppKit -framework Carbon -framework IOKit -framework UserNotifications -framework CoreAudio G15.m -o $A/Contents/MacOS/G15
 clang -fobjc-arc -O2 -Wall -mmacosx-version-min=13.0 -framework AppKit mkicon.m -o mkicon
 ./mkicon G15.iconset && iconutil -c icns G15.iconset -o $A/Contents/Resources/G15.icns
 cat > $A/Contents/Info.plist <<'EOF'

@@ -22,7 +22,7 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 EOC
 clang "${FLAGS[@]}" -c info.c -o info.o
 CXX=(-std=gnu++17 -nostdinc++ -fno-exceptions -fno-rtti -fapple-kext -Wall -Wno-deprecated-declarations -Wno-unused-parameter)
-OBJ=(); for s in kern_start kern_xepm kern_rtd3 kern_wake g15pm_control; do clang++ "${FLAGS[@]}" "${CXX[@]}" -c $s.cpp -o $s.o; OBJ+=($s.o); done
+OBJ=(); for s in kern_start kern_xepm kern_rtd3 kern_wake kern_revoke g15pm_control; do clang++ "${FLAGS[@]}" "${CXX[@]}" -c $s.cpp -o $s.o; OBJ+=($s.o); done
 clang++ "${FLAGS[@]}" "${CXX[@]}" -c $LILU/Library/plugin_start.cpp -o plugin_start.o
 K=$NAME.kext; mkdir -p $K/Contents/MacOS; cp Info.plist $K/Contents/
 clang++ -arch x86_64 -mkernel -nostdlib -static -Xlinker -kext -Xlinker -export_dynamic -mmacosx-version-min=13.0 \

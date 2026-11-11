@@ -43,6 +43,8 @@
 #import <IOKit/IOMessage.h>
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
+#import <CoreAudio/CoreAudio.h>
+#include <sys/sysctl.h>
 #import <UserNotifications/UserNotifications.h>
 #import <dlfcn.h>
 
@@ -121,6 +123,8 @@ static void showHUD(NSString *symbol, NSString *text, double pct) {
 static IOHIDManagerRef mgr;
 static NSInteger kbLevel = 2;                      // 0, 1, 2
 static const int KB_PCT[3] = {0, 50, 100};
+static BOOL kbBattery;                              // (11/11) perfil Bateria: o nivel do meio vale 25% em vez de 50%
+static int kbPct(NSInteger lv) { return lv == 1 && kbBattery ? 25 : KB_PCT[lv]; }
 static dispatch_queue_t kbq;                       // pacotes do controlador em ordem, fora da thread principal
 static volatile NSUInteger kbGen;                  // cada nova cor cancela as que ainda nao comecaram
 
@@ -204,7 +208,7 @@ static NSArray<NSData *> *kbLightPackets(NSDictionary *L) {
     }
     uint8_t a3[] = {0x21, 0x00, 0x03, 0xFF, 0xFF, 0, 0};
     [p addObject:kbPkt(a3, sizeof a3)];
-    uint8_t dm[] = {0x26, (uint8_t)(100 - KB_PCT[kbLevel]), 0x00, 0x04, 0x00, 0x01, 0x02, 0x03};
+    uint8_t dm[] = {0x26, (uint8_t)(100 - kbPct(kbLevel)), 0x00, 0x04, 0x00, 0x01, 0x02, 0x03};
     [p addObject:kbPkt(dm, sizeof dm)];
     return p;
 }
@@ -242,11 +246,11 @@ static void kbWindowRefresh(void);                 // a janela da luz acompanha 
 static void kbSet(NSInteger lv, BOOL showOnScreen) {
     kbLevel = lv;
     [prefs setInteger:kbLevel forKey:@"level"];
-    kbSend(KB_PCT[kbLevel]);
+    kbSend(kbPct(kbLevel));
     kbWindowRefresh();
     if (showOnScreen)
-        showHUD(kbLevel ? @"light.max" : @"light.min", kbLevel ? [NSString stringWithFormat:L("Luz do teclado: %d%%", "Keyboard light: %d%%"), KB_PCT[kbLevel]]
-                                                               : L("Luz do teclado: apagada", "Keyboard light: off"), KB_PCT[kbLevel]);
+        showHUD(kbLevel ? @"light.max" : @"light.min", kbLevel ? [NSString stringWithFormat:L("Luz do teclado: %d%%", "Keyboard light: %d%%"), kbPct(kbLevel)]
+                                                               : L("Luz do teclado: apagada", "Keyboard light: off"), kbPct(kbLevel));
 }
 
 static void kbStep(const char *via) {
@@ -451,11 +455,31 @@ static void setEpp(int e) {
     NSLog(@"G15PM: EPP %d %@", e, r == KERN_SUCCESS ? @"ok" : [NSString stringWithFormat:@"erro 0x%08x", r]);
 }
 
-static BOOL applyProfile(int p) {                  // perfil + boost das ventoinhas + EPP do perfil
+static void batteryExtras(int p);
+// (11/11) perfil Bateria: G15PMControl "RtxDeny" = a RTX parada recusa os programas (nao religa). Escreve so quando muda.
+static int rtxDenySent = -1;
+static void rtxDenySync(BOOL deny) {
+    if (rtxDenySent == deny) return;
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("G15PMControl"));
+    if (!sv) return;
+    kern_return_t r = IORegistryEntrySetCFProperties(sv, (__bridge CFDictionaryRef)@{@"RtxDeny": @(deny)});
+    BOOL has = [CFBridgingRelease(IORegistryEntryCreateCFProperty(sv, CFSTR("RtxDeny"), kCFAllocatorDefault, 0)) isKindOfClass:NSNumber.class];
+    IOObjectRelease(sv);
+    if (r == KERN_SUCCESS && has) rtxDenySent = deny;
+    NSLog(@"G15PM: RTX %s: %@", deny ? "recusa programas (Bateria)" : "religa sob demanda",
+          r == KERN_SUCCESS && has ? @"ok" : has ? [NSString stringWithFormat:@"erro 0x%08x", r] : @"G15PM sem RtxDeny (kext antigo)");
+    if (!has) rtxDenySent = deny;                  // kext antigo: nao insiste a cada tique
+}
+
+static int profileApplied = -1;                    // ultimo perfil trocado por este processo (o tick ve trocas de fora)
+static BOOL applyProfile(int p) {                  // perfil + boost das ventoinhas + EPP do perfil (+ extras da Bateria)
     if (fanWrite(@{@"Profile": @(p)}) != KERN_SUCCESS) return NO;
     if (hotFrom >= 0) hotFrom = profileFanBoost(p);   // quente: aplica quando esfriar
     else setBoost(profileFanBoost(p));
     setEpp(profileEpp(p));
+    profileApplied = p;
+    batteryExtras(p);
+    rtxDenySync(profileRank(p) == 0);
     return YES;
 }
 
@@ -474,12 +498,14 @@ static void profileStep(void) {                    // Fn+F9: proximo perfil
 }
 
 // ---------- RTX automatica (G15Fan RtxPm, 10/11) ----------
-// Sem nenhum programa na RTX (clientes do NVAccel) e sem monitor externo por 30 s na bateria ou 3 min na tomada, para a
+// Sem uso (com o G15PM do revoke: Device Utilization < 2%; sem ele: nenhum programa conectado) e sem monitor externo
+// por 30 s na bateria ou 5 min na tomada (3 min ate 11/11), para a
 // RTX (NVRM e audio HDMI no estado 0; com -g15fan-rtxpm-corte o G15Fan corta a energia). Ao conectar o carregador:
-// religa (e ela volta a parar depois de 3 min ociosa). Parada, a RTX nao ve o cabo HDMI: modo "Ligada" antes. Modo no menu (seletor RTX), preferencia local.g15 "rtxMode".
+// religa (e ela volta a parar depois de 5 min ociosa). Parada, a RTX nao ve o cabo HDMI: modo "Ligada" antes. Modo no menu (seletor RTX), preferencia local.g15 "rtxMode".
 static int rtxIdleTicks;
+static NSString *rtxLastWho;                       // quem esta segurando a RTX (log so quando muda)
 // modo (preferencia "rtxMode"): 0 desligada (para sempre que ociosa 30 s; um programa que a pedir ainda a religa),
-// 1 ligada (nunca para), 2 automatica (ociosa: 30 s na bateria, 3 min na tomada; religa no carregador)
+// 1 ligada (nunca para), 2 automatica (ociosa: 30 s na bateria, 5 min na tomada; religa no carregador)
 static int rtxMode(void) { id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rtxMode"]; return v ? MAX(0, MIN(2, [v intValue])) : 2; }
 static int rtxClients(void) {                      // conexoes abertas no NVAccel (Metal/OpenCL de algum programa)
     io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
@@ -493,28 +519,327 @@ static int rtxClients(void) {                      // conexoes abertas no NVAcce
     IOObjectRelease(sv);
     return n;
 }
+static NSString *rtxClientNames(void) {            // "pid 123, Foo" de cada cliente (IOUserClientCreator)
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!sv) return @"";
+    NSMutableOrderedSet *names = [NSMutableOrderedSet orderedSet];
+    io_iterator_t it = 0;
+    if (IORegistryEntryGetChildIterator(sv, kIOServicePlane, &it) == KERN_SUCCESS) {
+        io_object_t c;
+        while ((c = IOIteratorNext(it))) {
+            NSString *s = CFBridgingRelease(IORegistryEntryCreateCFProperty(c, CFSTR("IOUserClientCreator"), kCFAllocatorDefault, 0));
+            if ([s isKindOfClass:NSString.class]) [names addObject:s];
+            IOObjectRelease(c);
+        }
+        IOObjectRelease(it);
+    }
+    IOObjectRelease(sv);
+    return [names.array componentsJoinedByString:@"; "];
+}
 static BOOL rtxExternal(void) {                    // mais de uma tela ligada (espelhada conta)
     uint32_t n = 0; CGGetOnlineDisplayList(0, NULL, &n);
     return n > 1;
 }
+// (11/11) revoke + religar no uso de verdade (G15PM kern_revoke.cpp / kern_wake.cpp). Com o G15PMControl expondo
+// "RtxRevoke": a RTX para pelo USO (Device Utilization < 2% pelo tempo do modo), mesmo com programas conectados; antes
+// de parar liga o revoke (RtxRevoke 1: o primeiro uso de um programa conectado a religa). "RtxLazy" 1: listar as placas
+// do Metal (todo app faz ao abrir) nao religa mais; so um cliente do RM (o app criando o dispositivo) ou uma chamada
+// ao driver. Sem o G15PM novo: o criterio antigo (nenhum programa conectado).
+static id g15pmGet(NSString *k) {
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("G15PMControl"));
+    if (!sv) return nil;
+    id v = CFBridgingRelease(IORegistryEntryCreateCFProperty(sv, (__bridge CFStringRef)k, kCFAllocatorDefault, 0));
+    IOObjectRelease(sv);
+    return v;
+}
+static BOOL g15pmSet(NSString *k, BOOL v) {
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("G15PMControl"));
+    if (!sv) return NO;
+    kern_return_t r = IORegistryEntrySetCFProperties(sv, (__bridge CFDictionaryRef)@{k: @(v)});
+    IOObjectRelease(sv);
+    return r == KERN_SUCCESS && [g15pmGet(k) boolValue] == v;
+}
+static BOOL rtxRevokeAvail(void) { return g15pmGet(@"RtxRevoke") != nil && g15pmGet(@"RtxLazy") != nil; }
+// (11/11) atividade = chamadas ao driver da RTX ("RtxCalls" do G15PMControl, como o RTD3 fino do Linux conta cada
+// ioctl): um jogo leve a 60 quadros/s chama o driver o tempo todo, mesmo com o uso abaixo de 2%. Lido 1x por tique.
+static unsigned long long rtxCallsPrev; static BOOL rtxCallsMoved, rtxCallsHave;
+static void rtxCallsTick(void) {
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("G15PMControl"));
+    if (!sv) { rtxCallsHave = NO; return; }
+    IORegistryEntrySetCFProperties(sv, (__bridge CFDictionaryRef)@{@"Refresh": @YES});   // publica o total atual
+    NSNumber *n = CFBridgingRelease(IORegistryEntryCreateCFProperty(sv, CFSTR("RtxCalls"), kCFAllocatorDefault, 0));
+    IOObjectRelease(sv);
+    rtxCallsHave = [n isKindOfClass:NSNumber.class];
+    unsigned long long c = n.unsignedLongLongValue;
+    rtxCallsMoved = rtxCallsHave && c != rtxCallsPrev;
+    rtxCallsPrev = c;
+}
+static BOOL rtxIdleNow(NSDictionary *st) {
+    if (!rtxRevokeAvail()) return rtxClients() == 0;
+    return rtxInfo(st).util < 2 && !(rtxCallsHave && rtxCallsMoved);
+}
+
 static BOOL rtxSet(BOOL on, const char *why) {
+    int n = on ? 0 : rtxClients();
+    if (!on && n) {                                // programas conectados: so com o revoke ligado antes
+        if (!rtxRevokeAvail() || !g15pmSet(@"RtxRevoke", YES)) {
+            NSLog(@"RTX parar (%s): %d programa(s) conectado(s) e sem revoke; fica ligada", why, n);
+            rtxIdleTicks = 0; return NO;
+        }
+    }
     kern_return_t r = fanWrite(@{@"RtxPm": on ? @1 : @2});
-    NSLog(@"RTX %s (%s): %s", on ? "ligar" : "parar", why, r == KERN_SUCCESS ? "ok" : "erro");
-    rtxIdleTicks = 0;
+    NSLog(@"RTX %s (%s)%@: %s", on ? "ligar" : "parar", why,
+          n ? [NSString stringWithFormat:@", revoke com %d conexao(oes): %@", n, rtxClientNames()] : @"", r == KERN_SUCCESS ? "ok" : "erro");
+    rtxIdleTicks = 0; rtxLastWho = nil;
     return r == KERN_SUCCESS;
 }
 static void rtxTick(NSDictionary *st, int ac) {    // a cada 5 s
     int mode = rtxMode();
+    if (st && ![st[@"RtxParked"] boolValue]) rtxCallsTick();   // quem usa a RTX (painel), em qualquer modo
     if (!st || mode == 1 || (mode == 2 && ac < 0) || !st[@"RtxParked"] || [st[@"RtxParked"] boolValue]) { rtxIdleTicks = 0; return; }
-    if (rtxClients() || rtxExternal()) { rtxIdleTicks = 0; return; }
+    if (rtxRevokeAvail() && ![g15pmGet(@"RtxLazy") boolValue]) NSLog(@"G15PM: RtxLazy %s", g15pmSet(@"RtxLazy", YES) ? "ligado" : "erro");
+    if (!rtxIdleNow(st) || rtxExternal()) {
+        rtxIdleTicks = 0;
+        NSString *who = rtxExternal() ? @"monitor externo" : [NSString stringWithFormat:@"%@ (uso %d%%%@)", rtxClientNames(), rtxInfo(st).util,
+                                                rtxCallsMoved ? [NSString stringWithFormat:@", chamando o driver: %@", g15pmGet(@"RtxCallsLast") ?: @"?"] : @""];
+        if (![who isEqualToString:rtxLastWho]) { rtxLastWho = who; NSLog(@"RTX acordada e presa por: %@", who); }
+        return;
+    }
     if (mode == 0) { if (++rtxIdleTicks >= 6) rtxSet(NO, "modo desligada, ociosa 30 s"); return; }
-    if (++rtxIdleTicks >= (ac ? 36 : 6)) rtxSet(NO, ac ? "tomada, ociosa 3 min" : "bateria, ociosa 30 s");
+    if (++rtxIdleTicks >= (ac ? 60 : 6)) rtxSet(NO, ac ? "tomada, ociosa 5 min" : "bateria, ociosa 30 s");
 }
 static void rtxPower(int ac) {                     // carregador mudou
     rtxIdleTicks = 0;
     if (ac != 1 || rtxMode() != 2) return;
     NSDictionary *st = fanState(NO);
     if ([st[@"RtxParked"] boolValue]) rtxSet(YES, "carregador conectado");
+}
+
+
+// ---------- pausar em segundo plano (11/11) ----------
+// O painel mostra o app que esta chamando o driver da RTX ("RtxCallsLast" do G15PM entre os clientes do NVAccel) e uma
+// botao "Pausar em 2o plano" SO para ele e SO enquanto ESTE processo dele estiver aberto: fica guardado (pref "bgPausa":
+// pid + hora em que o processo comecou, contra pid reaproveitado) e sobrevive ao G15 reiniciar; fechou o app, apaga e na
+// proxima vez o botao volta a perguntar. Ligada: se o app
+// ficar 30 s fora da frente (2 min ate 11/11), o G15 o congela (SIGSTOP) -> ele para de chamar o driver e a RTX desliga pelo criterio
+// normal; ao voltar para ele (Cmd+Tab, clique, Dock) descongela na hora (SIGCONT) e a RTX religa sozinha. Desligar a
+// chave, fechar o app ou sair do G15 descongela.
+static const NSTimeInterval BG_SECS = 30;
+static pid_t bgPid; static unsigned long long bgStart; static NSString *bgName; static BOOL bgPaused; static NSDate *bgSince; static NSTimer *bgTimer;
+static void panelRefreshSoon(void);
+static pid_t rtxAppPid(NSString **nameOut) {       // app (janela normal) que esta chamando o driver da RTX agora
+    if (!rtxCallsMoved) return 0;
+    NSString *last = g15pmGet(@"RtxCallsLast");
+    if (![last isKindOfClass:NSString.class] || !last.length) return 0;
+    io_service_t sv = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
+    if (!sv) return 0;
+    pid_t found = 0; io_iterator_t it = 0;
+    if (IORegistryEntryGetChildIterator(sv, kIOServicePlane, &it) == KERN_SUCCESS) {
+        io_object_t c;
+        while (!found && (c = IOIteratorNext(it))) {
+            NSString *cr = CFBridgingRelease(IORegistryEntryCreateCFProperty(c, CFSTR("IOUserClientCreator"), kCFAllocatorDefault, 0));
+            IOObjectRelease(c);
+            int pid = 0; char nm[64] = {0};
+            if (![cr isKindOfClass:NSString.class] || sscanf(cr.UTF8String, "pid %d, %63[^\n]", &pid, nm) != 2) continue;
+            NSString *n = @(nm);
+            if (!([n hasPrefix:last] || [last hasPrefix:n])) continue;
+            NSRunningApplication *ra = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+            if (ra && ra.activationPolicy == NSApplicationActivationPolicyRegular && pid != getpid()) {
+                found = pid; if (nameOut) *nameOut = ra.localizedName ?: n;
+            }
+        }
+        IOObjectRelease(it);
+    }
+    IOObjectRelease(sv);
+    return found;
+}
+// Congelado, o app nao entrega mais audio e o macOS repete o ultimo pedaco do buffer (som "travado"). Nao ha volume
+// por app no macOS: silencia a saida padrao enquanto o app estiver congelado e devolve como estava ao descongelar.
+static int bgMutedByUs = -1;                       // -1 = nao mexemos; 0/1 = mudo de antes
+static AudioObjectID bgOutDev(void) {
+    AudioObjectID d = 0; UInt32 sz = sizeof d;
+    AudioObjectPropertyAddress a = {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    return AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &sz, &d) == noErr ? d : 0;
+}
+static BOOL bgMute(UInt32 on, UInt32 *was) {
+    AudioObjectID d = bgOutDev(); if (!d) return NO;
+    AudioObjectPropertyAddress a = {kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput, kAudioObjectPropertyElementMain};
+    UInt32 sz = sizeof(UInt32), cur = 0;
+    if (was && AudioObjectGetPropertyData(d, &a, 0, NULL, &sz, &cur) == noErr) *was = cur;
+    return AudioObjectSetPropertyData(d, &a, 0, NULL, sizeof on, &on) == noErr;
+}
+static void bgAudioBack(void);
+static void bgAudioOff(void) {                     // so ~1 s: o tempo de o macOS largar o audio parado; depois devolve
+    UInt32 was = 0;
+    if (bgMutedByUs < 0 && bgMute(1, &was)) {
+        bgMutedByUs = (int)was;
+        NSLog(@"pausa em segundo plano: som silenciado por 1 s (estava %s)", was ? "mudo" : "ligado");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ bgAudioBack(); });
+    } else if (bgMutedByUs < 0) NSLog(@"pausa em segundo plano: a saida de som nao aceita mudo");
+}
+static void bgAudioBack(void) {
+    if (bgMutedByUs < 0) return;
+    if (!bgMutedByUs) bgMute(0, NULL);             // so tira o mudo se estava ligado antes
+    NSLog(@"pausa em segundo plano: som devolvido (%s)", bgMutedByUs ? "continua mudo" : "ligado");
+    bgMutedByUs = -1;
+}
+static unsigned long long procStart(pid_t pid, BOOL *stopped) {   // hora em que o processo comecou (us); 0 = nao existe
+    struct kinfo_proc kp; size_t len = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) return 0;
+    if (stopped) *stopped = kp.kp_proc.p_stat == SSTOP;
+    return (unsigned long long)kp.kp_proc.p_starttime.tv_sec * 1000000ULL + kp.kp_proc.p_starttime.tv_usec;
+}
+static void bgSave(void) {
+    if (bgPid) [prefs setObject:@{@"pid": @(bgPid), @"inicio": @(procStart(bgPid, NULL)), @"nome": bgName ?: @"?"} forKey:@"bgPausa"];
+    else [prefs removeObjectForKey:@"bgPausa"];
+}
+static void bgResume(const char *why) {
+    if (bgPid && bgPaused) {
+        kill(bgPid, SIGCONT);
+        bgAudioBack();
+        NSLog(@"pausa em segundo plano: %@ (pid %d) DESCONGELADO (%s)", bgName, bgPid, why);
+    }
+    bgPaused = NO; bgSince = nil;
+}
+static void bgCheck(void) {                        // a cada 1 s com a chave ligada
+    if (!bgPid) return;
+    if ((kill(bgPid, 0) != 0 && errno == ESRCH) || procStart(bgPid, NULL) != bgStart) {   // app fechado (ou pid de outro): some
+        NSLog(@"pausa em segundo plano: %@ fechado", bgName);
+        bgPid = 0; bgSave(); bgPaused = NO; bgSince = nil; [bgTimer invalidate]; bgTimer = nil; panelRefreshSoon(); return;
+    }
+    if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == bgPid) {
+        if (bgPaused) { bgResume("voltou para a frente"); panelRefreshSoon(); }
+        bgSince = nil; return;
+    }
+    if (!bgSince) bgSince = [NSDate date];
+    if (!bgPaused && -bgSince.timeIntervalSinceNow >= BG_SECS) {
+        if (kill(bgPid, SIGSTOP) == 0) {
+            bgPaused = YES;
+            bgAudioOff();
+            NSLog(@"pausa em segundo plano: %@ (pid %d) CONGELADO apos %.0f s fora da frente", bgName, bgPid, BG_SECS);
+            notify(@"RTX", [NSString stringWithFormat:L("%@ pausado em segundo plano (som silenciado). Volte para ele para continuar.",
+                                                         "%@ paused in the background (sound muted). Switch back to it to continue."), bgName]);
+            panelRefreshSoon();
+        }
+    }
+}
+static void bgSet(pid_t pid, NSString *name);
+static void bgRestore(void) {                      // ao abrir o G15: a pausa guardada vale se o MESMO processo ainda roda
+    NSDictionary *d = [prefs dictionaryForKey:@"bgPausa"];
+    if (!d) return;
+    pid_t pid = [d[@"pid"] intValue]; BOOL stopped = NO;
+    unsigned long long st = procStart(pid, &stopped);
+    if (!pid || !st || st != [d[@"inicio"] unsignedLongLongValue]) {
+        NSLog(@"pausa em segundo plano: %@ ja fechou; esquecida", d[@"nome"]); [prefs removeObjectForKey:@"bgPausa"]; return;
+    }
+    bgSet(pid, d[@"nome"]);
+    bgPaused = stopped;                            // se o G15 reiniciou com ele congelado, continua congelado ate voltar a ele
+    NSLog(@"pausa em segundo plano: retomada para %@ (pid %d)%s", d[@"nome"], pid, stopped ? ", congelado" : "");
+}
+static void bgSet(pid_t pid, NSString *name) {     // pid 0 = desliga (e descongela)
+    if (!pid) {
+        bgResume("chave desligada");
+        if (bgPid) NSLog(@"pausa em segundo plano: desligada para %@", bgName);
+        bgPid = 0; bgName = nil; bgSave(); [bgTimer invalidate]; bgTimer = nil; return;
+    }
+    bgResume("trocando de app");
+    bgPid = pid; bgName = name; bgSince = nil; bgStart = procStart(pid, NULL); bgSave();
+    NSLog(@"pausa em segundo plano: ligada para %@ (pid %d), congela apos %.0f s fora da frente", name, pid, BG_SECS);
+    static BOOL obs;
+    if (!obs) {                                     // voltar para o app descongela na hora; sair do G15 tambem
+        obs = YES;
+        [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil
+                                                                     queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { bgCheck(); }];
+        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationWillTerminateNotification object:nil
+                                                         queue:nil usingBlock:^(NSNotification *n) { bgResume("G15 saindo"); }];
+        signal(SIGTERM, SIG_IGN);                   // launchctl/stop: descongela antes de sair
+        static dispatch_source_t term; term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
+        dispatch_source_set_event_handler(term, ^{ bgResume("G15 encerrado (SIGTERM)"); exit(0); });
+        dispatch_resume(term);
+    }
+    [bgTimer invalidate];
+    bgTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) { bgCheck(); }];
+    [[NSRunLoop mainRunLoop] addTimer:bgTimer forMode:NSRunLoopCommonModes];
+}
+
+// ---------- extras do perfil Bateria (11/11) ----------
+// Entrar na Bateria: tela interna a 60 Hz (de 120), brilho no maximo 50% e RTX no modo "Desligada". Sair da Bateria:
+// volta a taxa de antes (pref "hzAntesBateria") e a RTX vai para "Automatica" (se estava Desligada); o brilho fica.
+// O Bluetooth usa 1 min (em vez de 3) enquanto o perfil for Bateria (btTick).
+static int onAC(void);
+static void rtxSetMode(int m);
+static CGDirectDisplayID builtinDisplay(void) {
+    uint32_t n = 0; CGDirectDisplayID d[8];
+    if (CGGetOnlineDisplayList(8, d, &n) != kCGErrorSuccess) return 0;
+    for (uint32_t i = 0; i < n; i++) if (CGDisplayIsBuiltin(d[i])) return d[i];
+    return 0;
+}
+static BOOL setRefresh(double hz) {                // mesma resolucao, taxa mais proxima de hz
+    CGDirectDisplayID d = builtinDisplay();
+    if (!d) return NO;
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(d);
+    if (!cur) return NO;
+    BOOL ok = YES;
+    if (fabs(CGDisplayModeGetRefreshRate(cur) - hz) > 0.5) {
+        NSArray *ms = CFBridgingRelease(CGDisplayCopyAllDisplayModes(d, NULL));
+        CGDisplayModeRef best = NULL;
+        for (id o in ms) {
+            CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
+            if (CGDisplayModeGetWidth(m) != CGDisplayModeGetWidth(cur) || CGDisplayModeGetHeight(m) != CGDisplayModeGetHeight(cur) ||
+                CGDisplayModeGetPixelWidth(m) != CGDisplayModeGetPixelWidth(cur) || !CGDisplayModeIsUsableForDesktopGUI(m)) continue;
+            if (!best || fabs(CGDisplayModeGetRefreshRate(m) - hz) < fabs(CGDisplayModeGetRefreshRate(best) - hz)) best = m;
+        }
+        CGError e = kCGErrorIllegalArgument;          // permanente (como Ajustes): fica depois que o processo sai
+        CGDisplayConfigRef cfg = NULL;
+        if (best && fabs(CGDisplayModeGetRefreshRate(best) - hz) <= 0.5 && (e = CGBeginDisplayConfiguration(&cfg)) == kCGErrorSuccess) {
+            e = CGConfigureDisplayWithDisplayMode(cfg, d, best, NULL);
+            e = e == kCGErrorSuccess ? CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently) : (CGCancelDisplayConfiguration(cfg), e);
+        }
+        ok = e == kCGErrorSuccess;
+        NSLog(@"tela: %.0f Hz -> %.0f Hz: %@", CGDisplayModeGetRefreshRate(cur), hz, ok ? @"ok" : [NSString stringWithFormat:@"erro %d", e]);
+    }
+    CGDisplayModeRelease(cur);
+    return ok;
+}
+static double currentRefresh(void) {
+    CGDirectDisplayID d = builtinDisplay();
+    CGDisplayModeRef cur = d ? CGDisplayCopyDisplayMode(d) : NULL;
+    double hz = cur ? CGDisplayModeGetRefreshRate(cur) : 0;
+    if (cur) CGDisplayModeRelease(cur);
+    return hz;
+}
+static void setBrightness(float v, BOOL onlyLower) {   // DisplayServices (privado, por dlsym)
+    static int (*get)(CGDirectDisplayID, float *), (*set)(CGDirectDisplayID, float);
+    if (!get) { void *h = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_LAZY);
+                get = h ? dlsym(h, "DisplayServicesGetBrightness") : NULL; set = h ? dlsym(h, "DisplayServicesSetBrightness") : NULL; }
+    CGDirectDisplayID d = builtinDisplay(); float b = -1;
+    if (!get || !set || !d || get(d, &b) || fabsf(b - v) < 0.005f || (onlyLower && b <= v)) return;
+    int e = set(d, v);
+    NSLog(@"tela: brilho %.0f%% -> %.0f%%: %@", b * 100, v * 100, e ? [NSString stringWithFormat:@"erro %d", e] : @"ok");
+}
+static void kbProfileLight(BOOL bat) {              // luz do teclado: Bateria 25%, Balanceado 50% (nivel do meio)
+    kbBattery = bat;
+    if (kbLevel != 1) { kbLevel = 1; [prefs setInteger:kbLevel forKey:@"level"]; }
+    kbSend(kbPct(kbLevel));
+    kbWindowRefresh();
+}
+static void batteryExtras(int p) {                 // p = perfil novo
+    BOOL bat = profileRank(p) == 0;
+    if (bat || profileRank(p) == 3) kbProfileLight(bat);              // Bateria 25%, Balanceado 50%
+    else if (kbBattery) { kbBattery = NO; if (kbLevel == 1) kbSend(kbPct(1)); kbWindowRefresh(); }
+    if (profileRank(p) == 3) setBrightness(0.9f, NO);                 // Balanceado: brilho 90%
+    if (bat) {
+        double hz = currentRefresh();
+        if (hz > 61 && ![prefs objectForKey:@"hzAntesBateria"]) [prefs setDouble:hz forKey:@"hzAntesBateria"];
+        setRefresh(60);
+        setBrightness(0.5f, YES);
+        if (rtxMode() != 0) rtxSetMode(0);
+    } else {
+        id hz = [prefs objectForKey:@"hzAntesBateria"];
+        if (hz) { setRefresh([hz doubleValue]); [prefs removeObjectForKey:@"hzAntesBateria"]; }
+        [prefs removeObjectForKey:@"rtxModeAntesBateria"];   // (versao de 11/11 cedo) nao usado mais
+        if (rtxMode() == 0) { rtxSetMode(2); rtxPower(onAC()); }
+    }
 }
 
 // carregador: desconectado -> Bateria (0xA5), conectado -> Balanceado (0xA0); ao abrir (login) ja na bateria -> Bateria
@@ -1146,11 +1471,12 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 
 // ---------- Bluetooth automatico (#87, 10/11) ----------
 // Com o BT ligado o pacote nao passa de PC2 (NOT_L1 do CNVi) e o G15 gasta ~7-10 W a mais parado. Se o BT ficar ligado
-// sem nenhum aparelho conectado por 3 min, o app desliga o BT (preferencia "btAuto", padrao ligada; seletor no painel).
+// sem nenhum aparelho conectado por 3 min (1 min no perfil Bateria, 11/11), o app desliga o BT (preferencia "btAuto",
+// padrao ligada; seletor no painel).
 // Estado e aparelhos: system_profiler SPBluetoothDataType -json (sem permissao, ~0,2 s, fora da thread principal, a
 // cada 15 s). Ligar/desligar: IOBluetoothPreferenceSetControllerPowerState (IOBluetooth, por dlsym; o macOS pede a
 // permissao de Bluetooth ao G15 na 1a vez: NSBluetoothAlwaysUsageDescription no Info.plist).
-static const int BT_IDLE_SECS = 180;
+static int btLimit(void);                         // 60 s no perfil Bateria, senao 180 s
 static int btOn = -1, btConnected = -1;             // -1 = ainda nao lido
 static NSArray<NSString *> *btNames;               // aparelhos conectados
 static int btIdleSecs;
@@ -1196,7 +1522,8 @@ static void btSetPower(BOOL on, const char *why) {  // fora da thread principal:
             if (btOn == (on ? 1 : 0)) {
                 NSLog(@"Bluetooth %s", on ? "ligado" : "desligado");
                 if (!on && strcmp(why, "painel"))
-                    notify(@"Bluetooth", L("Desligado: 3 minutos sem aparelhos conectados.", "Turned off: no devices connected for 3 minutes."));
+                    notify(@"Bluetooth", btLimit() <= 60 ? L("Desligado: 1 minuto sem aparelhos conectados (perfil Bateria).", "Turned off: no devices connected for 1 minute (Battery profile).")
+                                                         : L("Desligado: 3 minutos sem aparelhos conectados.", "Turned off: no devices connected for 3 minutes."));
             } else {
                 NSLog(@"Bluetooth continua %s: pedido ignorado (permissao de Bluetooth do G15?)", btOn == 1 ? "ligado" : "desligado");
                 notify(@"Bluetooth", L("Não consegui mudar o Bluetooth: o G15 precisa da permissão de Bluetooth.",
@@ -1205,11 +1532,13 @@ static void btSetPower(BOOL on, const char *why) {  // fora da thread principal:
         }); });
     });
 }
+static int curProfile = -1;                        // ultimo perfil lido pelo tick
+static int btLimit(void) { return curProfile >= 0 && profileRank(curProfile) == 0 ? 60 : 180; }
 static void btTick(int secs) {                     // chamado a cada 15 s pelo tick
     btRead(^{
         if (btOn != 1 || btConnected != 0 || !btAuto()) { btIdleSecs = 0; return; }
         btIdleSecs += secs;
-        if (btIdleSecs >= BT_IDLE_SECS) btSetPower(NO, "3 min sem aparelhos");
+        if (btIdleSecs >= btLimit()) btSetPower(NO, btLimit() <= 60 ? "1 min sem aparelhos (Bateria)" : "3 min sem aparelhos");
     });
 }
 
@@ -1261,6 +1590,18 @@ static void panelToggle(NSStatusBarButton *b);
     lidEvent(readLid(), "tick");
     if (asleep) return;
     NSDictionary *st = fanState(YES);
+    if (st[@"Profile"]) {
+        curProfile = [st[@"Profile"] intValue];
+        rtxDenySync(profileRank(curProfile) == 0);
+        if (profileApplied < 0) profileApplied = curProfile;          // ao abrir: so acompanha (nao mexe na luz)
+        else if (profileApplied != curProfile) {                       // trocado por fora (G15 --perfil): luz do teclado
+            profileApplied = curProfile;
+            int rk = profileRank(curProfile);
+            if (rk == 0 || rk == 3) kbProfileLight(rk == 0);
+        }
+        BOOL kb = profileRank(curProfile) == 0;
+        if (kb != kbBattery) { kbBattery = kb; if (kbLevel == 1) kbSend(kbPct(1)); kbWindowRefresh(); }
+    }
     rtxTick(st, onAC());
     static int n; if (n++ % 3 == 0) btTick(15);       // Bluetooth a cada 15 s
     [self updateTitle:st];
@@ -1328,7 +1669,7 @@ static void panelToggle(NSStatusBarButton *b);
         NSDictionary *Lt = kbLight();
         NSArray *fxn = @[L("fixa", "static"), L("respiração", "breathing"), L("transição", "morph"), L("espectro", "spectrum"), L("onda", "wave")];
         NSUInteger fi = [kbEffects() indexOfObject:Lt[@"effect"]];
-        NSString *st = kbLevel ? [NSString stringWithFormat:@"%d%% · %@", KB_PCT[kbLevel], fxn[fi == NSNotFound ? 0 : fi]] : L("apagada", "off");
+        NSString *st = kbLevel ? [NSString stringWithFormat:@"%d%% · %@", kbPct(kbLevel), fxn[fi == NSNotFound ? 0 : fi]] : L("apagada", "off");
         NSMenuItem *ki = [self add:menu title:[NSString stringWithFormat:L("Luz do teclado: %@…", "Keyboard light: %@…"), st] action:@selector(openKb:) tag:0 on:NO];
         ki.image = [NSImage imageWithSystemSymbolName:@"keyboard" accessibilityDescription:nil];
     }
@@ -1390,7 +1731,7 @@ static void rtxSetMode(int m) {
     NSLog(@"RTX: modo %d", m);
     if (m == 1 && parked) rtxSet(YES, "modo ligada");
     else if (m == 0 && !parked) {
-        if (rtxClients() || rtxExternal())
+        if (!rtxIdleNow(fanState(NO)) || rtxExternal())
             notify(@"RTX", L("Em uso (programa ou monitor externo): desliga quando ficar ociosa.", "In use (app or external display): turns off when idle."));
         else rtxSet(NO, "modo desligada");
     }
@@ -1480,7 +1821,7 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 @end
 
 @implementation G15Panel {
-    NSTextField *_cpuT, *_rtxT, *_rpmT, *_rtxCap, *_profV, *_fanV, *_rtxV, *_btV, *_kbV, *_micV, *_sub;
+    NSTextField *_cpuT, *_rtxT, *_rpmT, *_hzT, *_btAutoL, *_rtxCap, *_profV, *_fanV, *_rtxV, *_btV, *_kbV, *_micV, *_sub;
     NSView *_rtxDot;
     NSSegmentedControl *_profSeg, *_fanSeg, *_rtxSeg, *_kbSeg;
     NSArray<NSNumber *> *_profIds;
@@ -1488,10 +1829,11 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     NSSlider *_mic;
     NSButton *_perm;
     NSBox *_rtxCard;
+    NSTextField *_appV, *_appInfo; NSButton *_bgBtn; NSImageView *_appIcon; NSBox *_appCard; pid_t _bgShownPid; NSString *_bgShownName;
     NSTimer *_timer;
 }
 - (NSView *)tile:(NSString *)symbol value:(NSTextField *)v caption:(NSTextField *)c {
-    v.font = [NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightSemibold];
+    v.font = [NSFont monospacedDigitSystemFontOfSize:17 weight:NSFontWeightSemibold];   // 4 quadros: 17 cabe "2550"
     NSStackView *s = vstack(@[hstack(@[sym(symbol, 12, nil), c], 4), v], 2);
     return card(s);
 }
@@ -1509,11 +1851,13 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 
     // temperaturas
     _cpuT = lbl(@"--", 20, NSFontWeightSemibold, nil); _rtxT = lbl(@"--", 20, NSFontWeightSemibold, nil); _rpmT = lbl(@"--", 20, NSFontWeightSemibold, nil);
+    _hzT = lbl(@"--", 20, NSFontWeightSemibold, nil);
     _rtxCap = lbl(@"RTX", 11, NSFontWeightMedium, NSColor.secondaryLabelColor);
     NSView *t1 = [self tile:@"cpu" value:_cpuT caption:lbl(@"CPU", 11, NSFontWeightMedium, NSColor.secondaryLabelColor)];
     NSView *t2 = [self tile:@"memorychip" value:_rtxT caption:_rtxCap];
     NSView *t3 = [self tile:@"fan" value:_rpmT caption:lbl(@"RPM", 11, NSFontWeightMedium, NSColor.secondaryLabelColor)];
-    NSStackView *tiles = hstack(@[t1, t2, t3], 8);
+    NSView *t4 = [self tile:@"display" value:_hzT caption:lbl(@"Hz", 11, NSFontWeightMedium, NSColor.secondaryLabelColor)];
+    NSStackView *tiles = hstack(@[t1, t2, t3, t4], 8);
     tiles.distribution = NSStackViewDistributionFillEqually;
 
     // perfil
@@ -1539,11 +1883,26 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     NSStackView *rh = head(@"cpu.fill", @"RTX 4050", _rtxV); [rh insertView:_rtxDot atIndex:3 inGravity:NSStackViewGravityLeading];
     _rtxCard = card(vstack(@[rh, _rtxSeg], 8));
 
+    // app usando a RTX (11/11): cartao proprio, so aparece com um app na RTX; botao "Pausar em 2º plano" so nesta execucao
+    _appV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _appInfo = lbl(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _appInfo.lineBreakMode = NSLineBreakByWordWrapping; _appInfo.maximumNumberOfLines = 2;
+    [_appInfo setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _bgBtn = [NSButton buttonWithTitle:L("Pausar em 2º plano", "Pause in background") target:self action:@selector(bgPause:)];
+    _bgBtn.controlSize = NSControlSizeSmall; _bgBtn.bezelStyle = NSBezelStyleRounded;
+    _bgBtn.toolTip = L("Só para este app e só enquanto ele estiver aberto: 30 s fora da frente, ele é congelado e a RTX pode desligar; ao voltar para ele, continua.",
+                       "Only for this app while it is open: after 30 s in the background it is frozen and the RTX can turn off; switching back resumes it.");
+    _appIcon = [NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"gamecontroller" accessibilityDescription:nil]];
+    _appIcon.imageScaling = NSImageScaleProportionallyUpOrDown;
+    [_appIcon.widthAnchor constraintEqualToConstant:32].active = YES; [_appIcon.heightAnchor constraintEqualToConstant:32].active = YES;
+    NSStackView *ah = hstack(@[_appIcon, lbl(L("App na RTX", "App on RTX"), 13, NSFontWeightSemibold, nil), spacer(), _appV], 7);
+    _appCard = card(vstack(@[ah, hstack(@[_appInfo, spacer(), _bgBtn], 8)], 8));
+
     // Bluetooth
     _btV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
     _btPower = [NSSwitch new]; _btPower.target = self; _btPower.action = @selector(btPower:); _btPower.controlSize = NSControlSizeSmall;
     _btAutoSw = [NSSwitch new]; _btAutoSw.target = self; _btAutoSw.action = @selector(btAuto:); _btAutoSw.controlSize = NSControlSizeSmall;
-    NSTextField *autoL = lbl(L("Desligar sem aparelhos (3 min)", "Turn off with no devices (3 min)"), 12, NSFontWeightRegular, nil);
+    NSTextField *autoL = _btAutoL = lbl(L("Desligar sem aparelhos (3 min)", "Turn off with no devices (3 min)"), 12, NSFontWeightRegular, nil);
     // (o SF Symbol "bluetooth" nao existe; ondas de radio no lugar)
     NSStackView *bh = hstack(@[sym(@"dot.radiowaves.left.and.right", 13, NSColor.controlAccentColor),
                                vstack(@[lbl(@"Bluetooth", 13, NSFontWeightSemibold, nil), _btV], 1), spacer(), _btPower], 7);
@@ -1576,7 +1935,7 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
                                                b.font = [NSFont systemFontOfSize:12]; }
     NSStackView *foot = hstack(@[_perm, spacer(), log, quit], 14);
 
-    NSStackView *root = vstack(@[top, tiles, profCard, fanCard, _rtxCard, btCard, kbCard, micCard, foot], 8);
+    NSStackView *root = vstack(@[top, tiles, profCard, fanCard, _rtxCard, _appCard, btCard, kbCard, micCard, foot], 8);
     root.edgeInsets = NSEdgeInsetsMake(14, 14, 10, 14);
     root.alignment = NSLayoutAttributeLeading;
     for (NSView *v in root.arrangedSubviews)
@@ -1602,6 +1961,9 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     int avg = 0; for (NSNumber *n in rr) avg += n.intValue; if (rr.count) avg /= (int)rr.count;
     _rpmT.stringValue = rpm ? [NSString stringWithFormat:@"%d", avg] : @"--";
     _rpmT.toolTip = [rr componentsJoinedByString:@" / "];
+    double hz = currentRefresh();                  // taxa atual da tela interna
+    _hzT.stringValue = hz > 0 ? [NSString stringWithFormat:@"%.0f", hz] : @"--";
+    _btAutoL.stringValue = [NSString stringWithFormat:L("Desligar sem aparelhos (%d min)", "Turn off with no devices (%d min)"), btLimit() / 60];
     NSColor *rc = r.state == 2 ? NSColor.systemGreenColor : r.state == 1 ? NSColor.systemYellowColor : NSColor.systemRedColor;
     _rtxDot.layer.backgroundColor = rc.CGColor;
     _rtxCap.stringValue = @"RTX";
@@ -1630,6 +1992,21 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 
     _rtxCard.hidden = !st[@"RtxParked"];
     _rtxSeg.selectedSegment = rtxMode();
+    {                                              // app usando a RTX + chave "Pausar em segundo plano" (so nesta execucao)
+        NSString *an = nil; pid_t ap = rtxAppPid(&an);
+        if (bgPid) { ap = bgPid; an = bgName; }    // o app escolhido continua aparecendo (mesmo congelado/parada)
+        _bgShownPid = ap; _bgShownName = an;
+        _appCard.hidden = ap == 0 || _rtxCard.hidden;
+        _appV.stringValue = an ?: @"";
+        NSImage *ic = ap ? [NSRunningApplication runningApplicationWithProcessIdentifier:ap].icon : nil;   // icone do proprio app
+        _appIcon.image = ic ?: [NSImage imageWithSystemSymbolName:@"gamecontroller" accessibilityDescription:nil];
+        _appIcon.contentTintColor = ic ? nil : NSColor.controlAccentColor;
+        BOOL on = bgPid && bgPid == ap;
+        _appInfo.stringValue = !on ? L("Usando a RTX", "Using the RTX")
+                             : bgPaused ? L("Pausado. Volte para ele para continuar.", "Paused. Switch back to it to continue.")
+                             : L("Pausa após 30 s em segundo plano", "Pauses after 30 s in the background");
+        _bgBtn.title = !on ? L("Pausar em 2º plano", "Pause in background") : bgPaused ? L("Retomar agora", "Resume now") : L("Cancelar", "Cancel");
+    }
     _rtxV.stringValue = [NSString stringWithFormat:@"%@%@", rtxStateName(r.state), r.state == 2 ? [NSString stringWithFormat:@" · %d%%", r.util] : @""];
 
     _btPower.state = btOn == 1 ? NSControlStateValueOn : NSControlStateValueOff;
@@ -1637,11 +2014,12 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     _btAutoSw.state = btAuto() ? NSControlStateValueOn : NSControlStateValueOff;
     NSString *bs = btOn < 0 ? @"…" : btOn == 0 ? L("desligado", "off")
                  : btConnected > 0 ? [btNames componentsJoinedByString:@", "]
-                 : btAuto() ? [NSString stringWithFormat:L("sem aparelhos · desliga em %d s", "no devices · off in %d s"), MAX(0, BT_IDLE_SECS - btIdleSecs)]
+                 : btAuto() ? [NSString stringWithFormat:L("sem aparelhos · desliga em %d s", "no devices · off in %d s"), MAX(0, btLimit() - btIdleSecs)]
                             : L("sem aparelhos", "no devices");
     _btV.stringValue = bs;
 
     _kbSeg.selectedSegment = kbLevel;
+    [_kbSeg setLabel:[NSString stringWithFormat:@"%d%%", kbPct(1)] forSegment:1];
     NSDictionary *Lt = kbLight();
     NSArray *fxn = @[L("fixa", "static"), L("respiração", "breathing"), L("transição", "morph"), L("espectro", "spectrum"), L("onda", "wave")];
     NSUInteger fi = [kbEffects() indexOfObject:Lt[@"effect"]];
@@ -1666,6 +2044,11 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 - (void)profile:(NSSegmentedControl *)s { if (s.selectedSegment >= 0 && s.selectedSegment < (NSInteger)_profIds.count) applyProfile(_profIds[s.selectedSegment].intValue); [self refresh]; }
 - (void)fan:(NSSegmentedControl *)s { setBoost((int)[@[@0, @25, @50, @75, @90, @100][s.selectedSegment] intValue]); [self refresh]; }
 - (void)rtx:(NSSegmentedControl *)s { rtxSetMode((int)s.selectedSegment); [self refresh]; }
+- (void)bgPause:(NSButton *)b {                    // liga para o app mostrado; ligado: cancela (e descongela)
+    if (bgPid && bgPid == _bgShownPid) bgSet(0, nil);
+    else if (_bgShownPid) bgSet(_bgShownPid, _bgShownName);
+    [self refresh];
+}
 - (void)btPower:(NSSwitch *)s { btSetPower(s.state == NSControlStateValueOn, "painel"); _btV.stringValue = @"…"; }
 - (void)btAuto:(NSSwitch *)s { [prefs setBool:s.state == NSControlStateValueOn forKey:@"btAuto"]; btIdleSecs = 0;
                                NSLog(@"Bluetooth automatico: %s", s.state == NSControlStateValueOn ? "ligado" : "desligado"); [self refresh]; }
@@ -1707,6 +2090,7 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 - (void)quit:(id)s { [NSApp terminate:nil]; }
 @end
 
+static void panelRefreshSoon(void) { if (panel && panel.pop.isShown) [panel refresh]; }
 static void panelToggle(NSStatusBarButton *b) {
     if (!panel) panel = [G15Panel new];
     if (panel.pop.shown) { [panel.pop performClose:nil]; return; }
@@ -1788,6 +2172,9 @@ int main(int argc, const char *argv[]) {
             [NSApplication sharedApplication];
             NSApp.appearance = [NSAppearance appearanceNamed:!strcmp(argv[3], "escuro") ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
             btOn = 1; btConnected = 0; btIdleSecs = 45;
+            if (getenv("G15_PAINEL_APP")) {          // previa do cartao "App na RTX" (G15_PAINEL_APP=nome [G15_PAINEL_PAUSADO=1])
+                bgPid = getpid(); bgName = @(getenv("G15_PAINEL_APP")); bgPaused = getenv("G15_PAINEL_PAUSADO") != NULL;
+            }
             G15Panel *p = [G15Panel new];
             NSView *v = p.pop.contentViewController.view;
             NSVisualEffectView *bg = [NSVisualEffectView new];
@@ -1806,6 +2193,7 @@ int main(int argc, const char *argv[]) {
         }
         if (argc >= 2 && !strncmp(argv[1], "--", 2) && strcmp(argv[1], "--daemon")) {   // ventoinhas pela linha de comando
             kern_return_t r = KERN_SUCCESS;
+            prefs = [[NSUserDefaults alloc] initWithSuiteName:@"local.g15"];   // --perfil: extras da Bateria guardam o estado
             if (!strcmp(argv[1], "--perfil") && argc == 3) r = applyProfile((int)strtol(argv[2], NULL, 0)) ? KERN_SUCCESS : KERN_FAILURE;   // perfil + ventoinhas + EPP
             else if (!strcmp(argv[1], "--boost") && argc == 3) r = fanWrite(@{@"FanBoost": @(atoi(argv[2]))});
             else if (strcmp(argv[1], "--estado")) { fprintf(stderr, "uso: G15 --estado | --perfil 0xNN | --boost N\n"); return 2; }
@@ -1879,6 +2267,7 @@ int main(int argc, const char *argv[]) {
             object:nil queue:nil usingBlock:^(NSNotification *n) { NSLog(@"acordou"); wakeRestore(); kbApplySoon(1.0); }];
         powerOpen();
         acOpen();
+        bgRestore();                                // pausa em 2o plano guardada (o app dela ainda aberto)
 
         NSLog(@"G15 iniciado, luz nivel %ld", (long)kbLevel);
         kbApplySoon(0.2);

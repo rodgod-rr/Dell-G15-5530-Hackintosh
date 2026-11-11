@@ -12,7 +12,7 @@
 #include <sys/proc.h>
 
 static mach_vm_address_t gNaOrg = 0;
-static uint32_t gWk[6] {};   // [5] = aberturas recusadas (coletores com a RTX parada)
+static uint32_t gWk[7] {};   // [5] = aberturas recusadas (coletores com a RTX parada), [6] = deixadas sem religar (RtxLazy)
 static UInt32 gWkType = 0;
 static void wkPublish() { IORegistryEntry::getRegistryRoot()->setProperty("G15RtxWake", gWk, sizeof(gWk)); }
 
@@ -21,6 +21,33 @@ static bool wkIsCollector() {
 	char nm[24] {}; proc_selfname(nm, sizeof(nm));
 	return !strcmp(nm, "systemstats");
 }
+
+// (11/11) Perfil Bateria: o G15.app liga "RtxDeny" no G15PMControl e, com a RTX parada, toda abertura e recusada (o Metal
+// abre cada placa so para lista-las; quem nao esta na nvmtl-allow.txt usa a Intel de qualquer jeito).
+static bool gWkDenyAll = false;
+void rtxWakeSetDeny(bool d) { gWkDenyAll = d; }
+bool rtxWakeGetDeny() { return gWkDenyAll; }
+
+// (11/11) "Religar no uso de verdade" (RtxLazy, G15.app liga junto com o revoke): todo programa abre o NVAccel com
+// tipo baixo (5...) so para listar as placas do Metal; isso nao religa mais. Quem vai usar a RTX abre um cliente do
+// RM (tipo 0x4E56xxxx, NVK criando o dispositivo) ou chama o driver (NVRMUserClient::externalMethod, gancho do
+// revoke): ai religa. "G15RtxLazyWho" = ultimos que abriram sem religar.
+static bool gWkLazy = false;
+void rtxWakeSetLazy(bool l) { gWkLazy = l; }
+bool rtxWakeGetLazy() { return gWkLazy; }
+
+// "nome pid tipo" nos ultimos 6 de uma lista do registro, o mais novo primeiro
+struct WkWho { char w[6][40]; unsigned n; };
+static void wkRecord(WkWho &l, const char *key) {
+	for (unsigned k = 5; k > 0; k--) memcpy(l.w[k], l.w[k - 1], sizeof(l.w[0]));
+	char nm[24] {}; proc_selfname(nm, sizeof(nm));
+	snprintf(l.w[0], sizeof(l.w[0]), "%s %d t%u", nm, proc_selfpid(), gWkType);
+	if (l.n < 6) l.n++;
+	auto arr = OSArray::withCapacity(l.n);
+	for (unsigned k = 0; arr && k < l.n; k++) { auto st = OSString::withCString(l.w[k]); if (st) { arr->setObject(st); st->release(); } }
+	if (arr) { IORegistryEntry::getRegistryRoot()->setProperty(key, arr); arr->release(); }
+}
+static WkWho gWho {}, gDenyWho {}, gLazyWho {};
 
 // true = recusar a abertura
 static bool wkEnsure() {
@@ -43,21 +70,23 @@ static bool wkEnsure() {
 		OSSafeReleaseNULL(nv);
 	}
 	if (need && wkIsCollector() && !checkKernelArgument("-g15rtxwake-all")) { gWk[5]++; deny = true; need = false; }
+	if (need && gWkDenyAll) {                       // perfil Bateria: ninguem religa; "G15RtxDenyWho" = ultimos recusados
+		gWk[5]++; deny = true; need = false;
+		wkRecord(gDenyWho, "G15RtxDenyWho");
+		char nm[24] {}; proc_selfname(nm, sizeof(nm));
+		IOLog("G15PM: RTX parada, abertura de %s recusada (perfil Bateria)\n", nm);
+	}
+	if (need && gWkLazy && (gWkType & 0xFFFF0000u) != 0x4E560000u) {   // so listando as placas: nao religa
+		gWk[6]++; need = false;
+		wkRecord(gLazyWho, "G15RtxLazyWho");
+	}
 	if (need) {
 		uint32_t ms = 0;
 		auto sym = OSSymbol::withCString("G15RtxWake");
 		IOReturn e = sym ? fan->callPlatformFunction(sym, true, &ms, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
 		OSSafeReleaseNULL(sym);
 		gWk[1]++; gWk[2] = ms;
-		// quem pediu: "G15RtxWakeWho" = ultimos 6 processos que religaram a RTX ("nome pid tipo"), o mais novo primeiro
-		static char who[6][40]; static unsigned nwho = 0;
-		for (unsigned k = 5; k > 0; k--) memcpy(who[k], who[k - 1], sizeof(who[0]));
-		char nm[24] {}; proc_selfname(nm, sizeof(nm));
-		snprintf(who[0], sizeof(who[0]), "%s %d t%u", nm, proc_selfpid(), gWkType);
-		if (nwho < 6) nwho++;
-		auto arr = OSArray::withCapacity(nwho);
-		for (unsigned k = 0; arr && k < nwho; k++) { auto st = OSString::withCString(who[k]); if (st) { arr->setObject(st); st->release(); } }
-		if (arr) { IORegistryEntry::getRegistryRoot()->setProperty("G15RtxWakeWho", arr); arr->release(); }
+		wkRecord(gWho, "G15RtxWakeWho");             // quem religou a RTX
 		if (e != kIOReturnSuccess || ms == 0xFFFFFFFF) gWk[3]++;
 		IOLog("G15PM: RTX pedida por um programa: religada (0x%x, %u ms)\n", e, ms);
 	}

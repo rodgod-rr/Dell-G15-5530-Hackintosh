@@ -5,6 +5,7 @@
 extern void xePmInstall(KernelPatcher &);
 extern void rtd3Install();
 extern void rtxWakeInstall();
+extern void rtxRevokeInstall();
 
 static const char *bootargOff[] {"-g15pmoff"};
 static const char *bootargDebug[] {"-g15pmdbg"};
@@ -25,5 +26,6 @@ PluginConfiguration ADDPR(config) {
 		lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { xePmInstall(patcher); });
 		rtd3Install();
 		rtxWakeInstall();
+		rtxRevokeInstall();
 	},
 };

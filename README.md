@@ -38,9 +38,18 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - Turning it back on calls `GONN`, and NullMoth resumes in about 1.2 s.
   - `G15PM` hooks `NVAccel::newUserClient`, so an app that opens the RTX turns it back on first and waits for it.
     macOS `systemstats` is refused while the RTX is off (it opened the RTX every ~10 min just to read stats).
+  - **Turn on only for real use (since 2026-11-11, `G15PM` `RtxLazy`).** Opening an app (Notes, TextEdit, Safari)
+    no longer wakes the RTX; the first real GPU call does (a windowed app waits about 2.7 s, VRAM intact).
+  - **"Idle" means no driver calls** (`G15PM` `RtxCalls`) and utilization under 2%, so the RTX can stop with apps
+    still open. A game that keeps drawing in the background keeps it on.
+  - In the Battery profile, `G15PM` `RtxDeny` refuses new RTX opens while it is off (the app falls back to the UHD).
   - G15.app has an "RTX ( Desligada | Ligada | Automática )" selector (off / on / auto). Auto turns the RTX off after
-    30 s idle on battery or 3 min on AC, and back on when the charger is plugged in. The menu bar shows "RTX" in red
+    30 s idle on battery or 5 min on AC, and back on when the charger is plugged in. The menu bar shows "RTX" in red
     when it is off, with the temperature from the EC sensor.
+  - **"App na RTX" card in G15.app:** shows the app using the RTX, with a "Pausar em 2º plano" (pause in background)
+    button for that app only, until it quits. After 30 s in the background the app is frozen (SIGSTOP, its sound
+    muted), so the RTX can turn off; switching back to it resumes it at once and the RTX comes back in about 3 s.
+    Tested with Hollow Knight, including unplugging the charger while it was frozen.
   - Idle on battery: about 24-29 W, against about 34 W with the RTX on.
   - Apps reach the RTX only if listed in `/Library/GPUBundles/nvmtl-allow.txt`. Use
     `tools/rtx/macos-rtx-allow.sh restrita [app ...]`; NullMoth's default `*` keeps it busy.
@@ -98,6 +107,10 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
+- **Rare UHD hang (under investigation).** A few times the UHD stopped scheduling work (`gpuRestart`), the screen went
+  black and WindowServer was killed by its watchdog; most cases came right after the RTX was powered back on. The
+  WhateverXe fork now logs the scheduler state on every GPU reset (`log show --predicate 'eventMessage CONTAINS
+  "G15-gpureset"'`) to find the cause.
 - **Rare flicker** at the bottom of translucent windows when the UHD is heavily loaded. Turning on Reduce Transparency
   hides it.
 - **Camera/microphone permissions:** with AMFI relaxed, macOS never shows the permission prompt for third-party apps.
