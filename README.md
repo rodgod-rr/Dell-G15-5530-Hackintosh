@@ -58,6 +58,10 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - H.264 hardware encode.
   - Live Text / Vision.
   - Apple Music with FairPlay.
+  - Apple TV app, App Store videos and video screen savers, without hanging the GPU. The video post-processing batch
+    used to get stuck on `MEDIA_OBJECT` ([WhateverXe#23](https://github.com/b00t0x/WhateverXe/issues/23),
+    [#60](https://github.com/b00t0x/WhateverXe/issues/60)); the workaround from
+    [WhateverXe#81](https://github.com/b00t0x/WhateverXe/issues/81) avoids that path and keeps H.264 hardware decode.
   - The VA driver needs patches; see Post-install.
 - **UHD RC6 (since 2026-11-11).** With the MacBookPro16,1 SMBIOS, AGPM applies a profile made for 9th-gen graphics whose
   `RCxControl`/`CPGControl` blocks stopped RC6 about 60 s after boot (GT stuck in C0, no package C-states).
@@ -94,8 +98,6 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
-- **Power draw while asleep is about 19 W.** In October, with the iGPU still unaccelerated, I measured about 3-5 W.
-  The cause is not isolated yet.
 - **Rare flicker** at the bottom of translucent windows when the UHD is heavily loaded. Turning on Reduce Transparency
   hides it.
 - **Camera/microphone permissions:** with AMFI relaxed, macOS never shows the permission prompt for third-party apps.
@@ -104,16 +106,12 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 
 ## What does not work
 
-- **Apple TV app and App Store videos hang the GPU**, which can reboot the Mac. Don't open them.
-  - The cause is the video post-processing media batch: the RCS stays stuck on `MEDIA_OBJECT`
-    ([WhateverXe#23](https://github.com/b00t0x/WhateverXe/issues/23), [#60](https://github.com/b00t0x/WhateverXe/issues/60)).
-  - A known workaround removes the hang but loses H.264 hardware decode. It is not applied here.
 - **Prime Video app / FairPlay Streaming:** the key request fails with -15842. Use a Widevine browser (Chrome,
   Firefox or Edge) instead.
 - **VP9 / AV1 hardware decode:** the driver does not expose them, so YouTube above 1080p is not available in Safari.
 - **Hibernation:** not set up (`hibernatemode 0`).
-- **Not tested:** the headphone jack, HDMI audio, USB-C video, the card reader, iMessage/FaceTime, FileVault,
-  Sidecar, AirDrop and Handoff.
+- **Not tested:** the headphone jack, HDMI audio, iMessage/FaceTime, FileVault, Sidecar, AirDrop and Handoff.
+  (The G15 5530 has no card reader and no video output on USB-C.)
 
 ## Will it work on my G15?
 
@@ -221,6 +219,9 @@ every binary patch checks its bytes first, so it stops on a different driver ver
    - Without it, WindowServer grows by hundreds of MB per minute.
 2. **VA driver patches, `avcfix` mode** (`post-install/macos-patch-wex-va.sh`).
    - Fixes H.264 hardware decode on Tahoe (key 6 of `SetParam`), plus two NULL checks.
+   - Then the video post-processing fix (`post-install/macos-va-vp81.sh aplicar`,
+     [WhateverXe#81](https://github.com/b00t0x/WhateverXe/issues/81)): in the VA driver, the `yuv2`/`NV12` output
+     list at `0x786fc4` goes from 2 entries to 0, so the Apple TV app and App Store videos no longer hang the GPU.
    - My machine uses the `avcfix-vame-k7` mode, which adds FairPlay (Apple Music). That mode needs the Tiger Lake VAME
      bundle, an Apple binary that is not included here.
 3. **Metal shim `stencilfix`** (`prebuilt/stencilfix`). Fixes wrong stencil reads, the white blocks in 3D apps.

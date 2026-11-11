@@ -5,6 +5,7 @@
 # Steps (each one is also a script you can run alone; backups of every patched file go to /Library/G15-uhd):
 #   1. Metal driver leak patch       post-install/macos-mtl-leakpatch.sh aplicar
 #   2. VA driver patches (avcfix)     post-install/macos-patch-wex-va.sh avcfix
+#      + video post-processing fix     post-install/macos-va-vp81.sh aplicar (WhateverXe#81: Apple TV/App Store no longer hang)
 #   3. Metal stencil shim            prebuilt/stencilfix/instalar.sh
 #   4. Audio HAL plug-in XeSpeakers  prebuilt/audio/install.sh
 #   5. G15.app (as your user)        prebuilt/G15.app-installer/install.sh
@@ -23,6 +24,10 @@ va_state() {   # avcfix NOP at 0x228358
   [ -f "$VA" ] || { echo "no VA driver"; return; }
   [ "$(xxd -s $((0x228358)) -l 7 -p "$VA")" = "0f1f8000000000" ] && echo "avcfix applied" || echo "not patched"
 }
+vp_state() {   # WhateverXe#81: yuv2/NV12 VP output list count 2 -> 0 at 0x786fc4
+  [ -f "$VA" ] || { echo "no VA driver"; return; }
+  case "$(xxd -s $((0x786fc4)) -l 4 -p "$VA")" in 00000000) echo "VP fix applied";; 02000000) echo "VP fix not applied";; *) echo "VP fix: unexpected bytes";; esac
+}
 check() {
   local K; K=$(kmutil showloaded 2>/dev/null)
   loaded() { printf '%s\n' "$K" | grep -c "$1" >/dev/null && echo loaded || echo "NOT loaded"; }
@@ -30,7 +35,7 @@ check() {
   echo "WhateverXe Graphics: $(gfx || true)  (tested: 0.4.0)"
   echo "WhateverXe kext:     $(printf '%s\n' "$K" | awk '/org.b00t0x.WhateverXe /{print $7; exit}' | tr -d '()')"
   echo "1. leak patch:       $(bash "$H/post-install/macos-mtl-leakpatch.sh" estado 2>/dev/null | sed -e 's/leakpatch do driver Metal: //' -e 's/aplicado/applied/')"
-  echo "2. VA driver:        $(va_state)"
+  echo "2. VA driver:        $(va_state); $(vp_state)"
   echo "3. stencil shim:     $([ -f "$MTL/impostor-real.dylib" ] && echo installed || echo "not installed")"
   echo "4. XeSpeakers:       $([ -d /Library/Audio/Plug-Ins/HAL/XeSpeakers.driver ] && echo installed || echo "not installed"); AudShim kext $(loaded AudShim)"
   echo "5. G15.app:          $([ -d "$(eval echo ~$U)/Applications/G15.app" ] && echo installed || echo "not installed"); G15Fan kext $(loaded G15Fan)"
@@ -47,6 +52,7 @@ case "${1:-check}" in
     echo "== 1. Metal driver leak patch"; bash "$H/post-install/macos-mtl-leakpatch.sh" aplicar || echo "   (step 1 failed)"
     echo "== 2. VA driver patches (avcfix)"
     if [ "$(va_state)" = "avcfix applied" ]; then echo "   already applied"; else bash "$H/post-install/macos-patch-wex-va.sh" avcfix || echo "   (step 2 failed)"; fi
+    if [ "$(vp_state)" = "VP fix applied" ]; then echo "   VP fix already applied"; else bash "$H/post-install/macos-va-vp81.sh" aplicar || echo "   (step 2, VP fix, failed)"; fi
     echo "== 3. Metal stencil shim"; bash "$H/prebuilt/stencilfix/instalar.sh" || echo "   (step 3 failed)"
     echo "== 4. Audio plug-in";       bash "$H/prebuilt/audio/install.sh" || echo "   (step 4 failed)"
     echo "== 5. G15.app";             sudo -u "$U" bash "$H/prebuilt/G15.app-installer/install.sh" || echo "   (step 5 failed)"
