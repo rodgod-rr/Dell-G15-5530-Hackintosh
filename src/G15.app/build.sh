@@ -27,6 +27,7 @@ cat > $A/Contents/Info.plist <<'EOF'
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Desligar o Bluetooth quando nenhum aparelho estiver conectado (economia de energia).</string>
   <key>NSHumanReadableCopyright</key><string>Teclas Fn do Dell G15 5530 (luz do teclado e ventoinhas)</string>
 </dict>
 </plist>

@@ -44,8 +44,10 @@
 #import <IOKit/ps/IOPowerSources.h>
 #import <IOKit/ps/IOPSKeys.h>
 #import <UserNotifications/UserNotifications.h>
+#import <dlfcn.h>
 
 static NSUserDefaults *prefs;
+static BOOL g15Quitting;                           // reiniciando (permissao do proprio G15): nao confere/avisa o BT
 
 // textos: portugues se o idioma do sistema for portugues, ingles nos outros
 static BOOL PT;
@@ -554,6 +556,7 @@ static NSMutableDictionary<NSString *, NSDate *> *tccSeen;   // chave "bundle|se
 static BOOL tccAsking;
 
 static NSString *tccServiceName(NSString *s) {
+    if ([s isEqualToString:@"kTCCServiceBluetoothAlways"]) return L("o Bluetooth", "Bluetooth");
     return [s isEqualToString:@"kTCCServiceCamera"] ? L("a câmera", "the camera") : L("o microfone", "the microphone");
 }
 
@@ -612,7 +615,37 @@ static void tccAsk(NSString *bid, NSString *svc) {
     if (tccGrant(bid, svc, &err)) {
         d[key] = @"permitido"; [prefs setObject:d forKey:@"tccDecisions"];
         NSLog(@"permissao de %@ para %@: gravada no TCC.db", svc, bid);
-        notify(app, [NSString stringWithFormat:L("Acesso a %@ permitido. Feche e abra o app.", "Access to %@ allowed. Quit and reopen the app."), tccServiceName(svc)]);
+        if ([bid isEqualToString:NSBundle.mainBundle.bundleIdentifier]) {   // o proprio G15 (Bluetooth): reinicia
+            NSLog(@"permissao do proprio G15: reiniciando");
+            g15Quitting = YES;
+            run(@"/bin/sh", @[@"-c", [NSString stringWithFormat:@"sleep 2; /usr/bin/open -g '%@' --args --daemon", NSBundle.mainBundle.bundlePath]]);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
+            return;
+        }
+        NSRunningApplication *ra = [NSRunningApplication runningApplicationsWithBundleIdentifier:bid].firstObject;
+        if (!ra) { notify(app, [NSString stringWithFormat:L("Acesso a %@ permitido.", "Access to %@ allowed."), tccServiceName(svc)]); return; }
+        NSAlert *r = [NSAlert new];                // o app so ve a permissao nova depois de reaberto
+        r.messageText = [NSString stringWithFormat:L("Acesso a %@ permitido para “%@”.", "Access to %@ allowed for “%@”."), tccServiceName(svc), app];
+        r.informativeText = L("O app só passa a usar a permissão depois de reaberto.", "The app only uses the permission after it is reopened.");
+        [r addButtonWithTitle:L("Reabrir agora", "Reopen now")];
+        [r addButtonWithTitle:L("Depois", "Later")];
+        [NSApp activateIgnoringOtherApps:YES];
+        if ([r runModal] != NSAlertFirstButtonReturn) return;
+        NSURL *url = ra.bundleURL;
+        NSLog(@"reabrindo %@ (%@)", app, bid);
+        [ra terminate];
+        __block int tries = 0;                     // espera fechar (ate 10 s; depois forca) e abre de novo
+        __block void (^wait)(void);
+        wait = ^{
+            if (!ra.terminated && ++tries < 20) { dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), wait); return; }
+            if (!ra.terminated) [ra forceTerminate];
+            NSWorkspaceOpenConfiguration *c = [NSWorkspaceOpenConfiguration configuration];
+            [[NSWorkspace sharedWorkspace] openApplicationAtURL:url configuration:c completionHandler:^(NSRunningApplication *a, NSError *e) {
+                if (e) NSLog(@"reabrir %@: %@", bid, e.localizedDescription);
+            }];
+            wait = nil;
+        };
+        wait();
     } else {
         NSLog(@"permissao de %@ para %@: falhou (%@)", svc, bid, err);
         NSAlert *f = [NSAlert new];
@@ -631,7 +664,8 @@ static void tccLine(NSString *l) {
     if (b.location == NSNotFound || s.location == NSNotFound) return;
     NSString *bid = [l substringWithRange:NSMakeRange(NSMaxRange(a), b.location - NSMaxRange(a))];
     NSString *svc = [[[l substringFromIndex:s.location + 10] componentsSeparatedByString:@" "] firstObject];
-    if (![svc isEqualToString:@"kTCCServiceMicrophone"] && ![svc isEqualToString:@"kTCCServiceCamera"]) return;
+    if (![svc isEqualToString:@"kTCCServiceMicrophone"] && ![svc isEqualToString:@"kTCCServiceCamera"] &&
+        ![svc isEqualToString:@"kTCCServiceBluetoothAlways"]) return;
     if ([bid hasPrefix:@"/"] || [bid hasPrefix:@"com.apple."]) return;   // processos do sistema: nao e com a gente
     NSCharacterSet *ok = [NSCharacterSet characterSetWithCharactersInString:
                           @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"];
@@ -666,7 +700,7 @@ static void tccStart(void) {
     };
     NSError *err = nil;
     if (![tccLog launchAndReturnError:&err]) NSLog(@"log stream do tccd: %@", err.localizedDescription);
-    else NSLog(@"acompanhando os pedidos de microfone/camera negados pelo tccd");
+    else NSLog(@"acompanhando os pedidos de microfone/camera/Bluetooth negados pelo tccd");
 }
 
 // ---------- supressor de ruido do microfone (plug-in XeSpeakers) ----------
@@ -1110,6 +1144,80 @@ static void kbWindowOpen(void) {
 }
 static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 
+// ---------- Bluetooth automatico (#87, 10/11) ----------
+// Com o BT ligado o pacote nao passa de PC2 (NOT_L1 do CNVi) e o G15 gasta ~7-10 W a mais parado. Se o BT ficar ligado
+// sem nenhum aparelho conectado por 3 min, o app desliga o BT (preferencia "btAuto", padrao ligada; seletor no painel).
+// Estado e aparelhos: system_profiler SPBluetoothDataType -json (sem permissao, ~0,2 s, fora da thread principal, a
+// cada 15 s). Ligar/desligar: IOBluetoothPreferenceSetControllerPowerState (IOBluetooth, por dlsym; o macOS pede a
+// permissao de Bluetooth ao G15 na 1a vez: NSBluetoothAlwaysUsageDescription no Info.plist).
+static const int BT_IDLE_SECS = 180;
+static int btOn = -1, btConnected = -1;             // -1 = ainda nao lido
+static NSArray<NSString *> *btNames;               // aparelhos conectados
+static int btIdleSecs;
+static BOOL btBusy;
+static dispatch_queue_t btq;
+static BOOL btAuto(void) { id v = [prefs objectForKey:@"btAuto"]; return v ? [v boolValue] : YES; }
+static void btRead(void (^done)(void)) {           // assincrono; done roda na thread principal
+    if (btBusy) {                                  // leitura em curso: tenta de novo em 1 s (nao perde o "done")
+        if (done) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ btRead(done); });
+        return;
+    }
+    btBusy = YES;
+    if (!btq) btq = dispatch_queue_create("g15.bt", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(btq, ^{
+        NSTask *t = [NSTask new]; NSPipe *p = [NSPipe pipe];
+        t.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/system_profiler"];
+        t.arguments = @[@"SPBluetoothDataType", @"-json"]; t.standardOutput = p; t.standardError = NSFileHandle.fileHandleWithNullDevice;
+        int on = -1, n = -1; NSMutableArray *names = [NSMutableArray array];
+        if ([t launchAndReturnError:nil]) {
+            NSData *d = [p.fileHandleForReading readDataToEndOfFile]; [t waitUntilExit];
+            NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+            NSDictionary *bt = [j[@"SPBluetoothDataType"] firstObject];
+            NSString *s = bt[@"controller_properties"][@"controller_state"];
+            if (s) on = [s isEqualToString:@"attrib_on"];
+            NSArray *c = bt[@"device_connected"];
+            n = (int)c.count;
+            for (NSDictionary *e in c) [names addObjectsFromArray:e.allKeys];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ btOn = on; btConnected = n; btNames = names; btBusy = NO; if (done) done(); });
+    });
+}
+static void btSetPower(BOOL on, const char *why) {  // fora da thread principal: a 1a chamada pode esperar a permissao
+    if (!btq) btq = dispatch_queue_create("g15.bt", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(btq, ^{
+        void (*set)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "IOBluetoothPreferenceSetControllerPowerState");
+        if (!set) { void *h = dlopen("/System/Library/Frameworks/IOBluetooth.framework/IOBluetooth", RTLD_LAZY);
+                    set = h ? (void (*)(int))dlsym(h, "IOBluetoothPreferenceSetControllerPowerState") : NULL; }
+        if (set) set(on ? 1 : 0);
+        NSLog(@"Bluetooth %s (%s): %s", on ? "ligar" : "desligar", why, set ? "pedido" : "sem a funcao do IOBluetooth");
+        sleep(2);                                  // confere: o bluetoothd ignora o pedido sem a permissao de Bluetooth
+        dispatch_async(dispatch_get_main_queue(), ^{ btIdleSecs = 0; btRead(^{
+            if (g15Quitting) return;
+            if (btOn == (on ? 1 : 0)) {
+                NSLog(@"Bluetooth %s", on ? "ligado" : "desligado");
+                if (!on && strcmp(why, "painel"))
+                    notify(@"Bluetooth", L("Desligado: 3 minutos sem aparelhos conectados.", "Turned off: no devices connected for 3 minutes."));
+            } else {
+                NSLog(@"Bluetooth continua %s: pedido ignorado (permissao de Bluetooth do G15?)", btOn == 1 ? "ligado" : "desligado");
+                notify(@"Bluetooth", L("Não consegui mudar o Bluetooth: o G15 precisa da permissão de Bluetooth.",
+                                       "Could not change Bluetooth: G15 needs the Bluetooth permission."));
+            }
+        }); });
+    });
+}
+static void btTick(int secs) {                     // chamado a cada 15 s pelo tick
+    btRead(^{
+        if (btOn != 1 || btConnected != 0 || !btAuto()) { btIdleSecs = 0; return; }
+        btIdleSecs += secs;
+        if (btIdleSecs >= BT_IDLE_SECS) btSetPower(NO, "3 min sem aparelhos");
+    });
+}
+
+@class G15Panel;
+static G15Panel *panel;
+static void rtxSetMode(int m);
+static void panelToggle(NSStatusBarButton *b);
+
 @interface G15Menu : NSObject <NSMenuDelegate>
 @property NSStatusItem *item;
 @end
@@ -1154,6 +1262,7 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
     if (asleep) return;
     NSDictionary *st = fanState(YES);
     rtxTick(st, onAC());
+    static int n; if (n++ % 3 == 0) btTick(15);       // Bluetooth a cada 15 s
     [self updateTitle:st];
     if (!st) return;
     int t = MAX(fanTemp(st, @"0x01"), fanTemp(st, @"0x06")), b = fanBoost(st);
@@ -1249,7 +1358,7 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
         for (NSString *k in [dec.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
             NSArray *p = [k componentsSeparatedByString:@"|"];
             [tm addItemWithTitle:[NSString stringWithFormat:@"%@: %@ (%@)", tccAppName(p.firstObject),
-                                  [p.lastObject isEqualToString:@"kTCCServiceCamera"] ? L("câmera", "camera") : L("microfone", "microphone"),
+                                  [p.lastObject isEqualToString:@"kTCCServiceCamera"] ? L("câmera", "camera") : [p.lastObject isEqualToString:@"kTCCServiceBluetoothAlways"] ? @"Bluetooth" : L("microfone", "microphone"),
                                   [dec[k] isEqualToString:@"permitido"] ? L("permitido", "allowed") : L("negado", "denied")]
                           action:nil keyEquivalent:@""];
         }
@@ -1272,8 +1381,9 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 }
 - (void)nsSave:(NSNumber *)db { nsSetAtten(db.intValue); }
 - (void)setFan:(NSMenuItem *)i { setBoost((int)i.tag); }
-- (void)rtxMode:(NSSegmentedControl *)sc {
-    int m = (int)sc.selectedSegment;
+- (void)rtxMode:(NSSegmentedControl *)sc { rtxSetMode((int)sc.selectedSegment); }
+@end
+static void rtxSetMode(int m) {
     [[NSUserDefaults standardUserDefaults] setInteger:m forKey:@"rtxMode"];
     rtxIdleTicks = 0;
     BOOL parked = [fanState(NO)[@"RtxParked"] boolValue];
@@ -1285,6 +1395,9 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
         else rtxSet(NO, "modo desligada");
     }
 }
+@interface G15Menu (Acoes)
+@end
+@implementation G15Menu (Acoes)
 - (void)setProfile:(NSMenuItem *)i { applyProfile((int)i.tag); }
 - (void)openKb:(id)s { kbWindowOpen(); }
 - (void)openLog:(id)s {
@@ -1292,7 +1405,314 @@ static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 }
 - (void)tccForget:(id)s { [prefs removeObjectForKey:@"tccDecisions"]; [tccSeen removeAllObjects]; NSLog(@"respostas de permissao esquecidas"); }
 - (void)quit:(id)s { [NSApp terminate:nil]; }      // saida normal: o LaunchAgent nao relanca ate o proximo login
+- (void)clicked:(NSStatusBarButton *)b {          // esquerdo: painel; direito (ou ctrl): menu classico
+    NSEvent *e = NSApp.currentEvent;
+    if (e.type == NSEventTypeRightMouseUp || (e.modifierFlags & NSEventModifierFlagControl)) {
+        NSMenu *m = [NSMenu new]; m.delegate = self; self.item.menu = m;
+        [b performClick:nil];
+        self.item.menu = nil;
+    } else panelToggle(b);
+}
 @end
+
+// ---------- painel (10/11): popover no estilo da Central de Controle ----------
+// Clique esquerdo no icone abre; direito abre o menu classico. Cartoes: temperaturas/RPM, perfil, ventoinhas, RTX,
+// Bluetooth (ligado/desligado e o automatico de 3 min), luz do teclado (brilho + janela de cores) e supressor do mic.
+// Enquanto aberto, atualiza a cada 2 s.
+static NSColor *cardFill(void) {
+    return [NSColor colorWithName:nil dynamicProvider:^NSColor *(NSAppearance *a) {
+        BOOL dark = [[a bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] isEqualToString:NSAppearanceNameDarkAqua];
+        return dark ? [NSColor colorWithWhite:1 alpha:0.07] : [NSColor colorWithWhite:0 alpha:0.045];
+    }];
+}
+static NSTextField *lbl(NSString *s, CGFloat size, NSFontWeight w, NSColor *c) {
+    NSTextField *t = [NSTextField labelWithString:s ?: @""];
+    t.font = [NSFont systemFontOfSize:size weight:w]; t.textColor = c ?: NSColor.labelColor;
+    t.lineBreakMode = NSLineBreakByTruncatingTail;
+    [t setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return t;
+}
+static NSImageView *sym(NSString *name, CGFloat size, NSColor *tint) {
+    NSImage *i = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    i = [i imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:NSFontWeightMedium]];
+    NSImageView *v = [NSImageView imageViewWithImage:i ?: [NSImage new]];
+    v.contentTintColor = tint ?: NSColor.secondaryLabelColor;
+    [v setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return v;
+}
+static NSStackView *hstack(NSArray<NSView *> *v, CGFloat spacing) {
+    NSStackView *s = [NSStackView stackViewWithViews:v];
+    s.orientation = NSUserInterfaceLayoutOrientationHorizontal; s.spacing = spacing; s.alignment = NSLayoutAttributeCenterY;
+    return s;
+}
+static NSStackView *vstack(NSArray<NSView *> *v, CGFloat spacing) {
+    NSStackView *s = [NSStackView stackViewWithViews:v];
+    s.orientation = NSUserInterfaceLayoutOrientationVertical; s.spacing = spacing; s.alignment = NSLayoutAttributeLeading;
+    return s;
+}
+static NSView *spacer(void) {
+    NSView *v = [NSView new];
+    [v setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    return v;
+}
+static NSBox *card(NSView *content) {
+    NSBox *b = [NSBox new];
+    b.boxType = NSBoxCustom; b.borderWidth = 0; b.cornerRadius = 12; b.fillColor = cardFill();
+    b.titlePosition = NSNoTitle; b.contentViewMargins = NSMakeSize(12, 10);
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [b.contentView addSubview:content];
+    [NSLayoutConstraint activateConstraints:@[
+        [content.leadingAnchor constraintEqualToAnchor:b.contentView.leadingAnchor],
+        [content.trailingAnchor constraintEqualToAnchor:b.contentView.trailingAnchor],
+        [content.topAnchor constraintEqualToAnchor:b.contentView.topAnchor],
+        [content.bottomAnchor constraintEqualToAnchor:b.contentView.bottomAnchor]]];
+    return b;
+}
+// cabecalho de cartao: icone, titulo e um valor a direita
+static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) {
+    NSStackView *h = hstack(@[sym(symbol, 13, NSColor.controlAccentColor), lbl(title, 13, NSFontWeightSemibold, nil), spacer(), value], 7);
+    return h;
+}
+
+@interface G15Panel : NSObject <NSPopoverDelegate>
+@property NSPopover *pop;
+- (void)refresh;
+@end
+
+@implementation G15Panel {
+    NSTextField *_cpuT, *_rtxT, *_rpmT, *_rtxCap, *_profV, *_fanV, *_rtxV, *_btV, *_kbV, *_micV, *_sub;
+    NSView *_rtxDot;
+    NSSegmentedControl *_profSeg, *_fanSeg, *_rtxSeg, *_kbSeg;
+    NSArray<NSNumber *> *_profIds;
+    NSSwitch *_btPower, *_btAutoSw;
+    NSSlider *_mic;
+    NSButton *_perm;
+    NSBox *_rtxCard;
+    NSTimer *_timer;
+}
+- (NSView *)tile:(NSString *)symbol value:(NSTextField *)v caption:(NSTextField *)c {
+    v.font = [NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightSemibold];
+    NSStackView *s = vstack(@[hstack(@[sym(symbol, 12, nil), c], 4), v], 2);
+    return card(s);
+}
+- (instancetype)init {
+    if (!(self = [super init])) return nil;
+    const CGFloat W = 340;
+    // topo
+    _sub = lbl(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    NSImageView *logo = sym(@"laptopcomputer", 18, NSColor.controlAccentColor);
+    NSStackView *title = vstack(@[lbl(@"Dell G15", 15, NSFontWeightBold, nil), _sub], 0);
+    NSButton *more = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"ellipsis.circle" accessibilityDescription:@"Mais"]
+                                        target:self action:@selector(more:)];
+    more.bordered = NO; more.contentTintColor = NSColor.secondaryLabelColor;
+    NSStackView *top = hstack(@[logo, title, spacer(), more], 10);
+
+    // temperaturas
+    _cpuT = lbl(@"--", 20, NSFontWeightSemibold, nil); _rtxT = lbl(@"--", 20, NSFontWeightSemibold, nil); _rpmT = lbl(@"--", 20, NSFontWeightSemibold, nil);
+    _rtxCap = lbl(@"RTX", 11, NSFontWeightMedium, NSColor.secondaryLabelColor);
+    NSView *t1 = [self tile:@"cpu" value:_cpuT caption:lbl(@"CPU", 11, NSFontWeightMedium, NSColor.secondaryLabelColor)];
+    NSView *t2 = [self tile:@"memorychip" value:_rtxT caption:_rtxCap];
+    NSView *t3 = [self tile:@"fan" value:_rpmT caption:lbl(@"RPM", 11, NSFontWeightMedium, NSColor.secondaryLabelColor)];
+    NSStackView *tiles = hstack(@[t1, t2, t3], 8);
+    tiles.distribution = NSStackViewDistributionFillEqually;
+
+    // perfil
+    _profV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _profSeg = [NSSegmentedControl segmentedControlWithLabels:@[@""] trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(profile:)];
+    _profSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    NSBox *profCard = card(vstack(@[head(@"gauge.with.dots.needle.67percent", L("Perfil", "Profile"), _profV), _profSeg], 8));
+
+    // ventoinhas
+    _fanV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _fanSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Auto", "Auto"), @"25", @"50", @"75", @"90", @"100"]
+                                                trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(fan:)];
+    _fanSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    NSBox *fanCard = card(vstack(@[head(@"wind", L("Ventoinhas", "Fans"), _fanV), _fanSeg], 8));
+
+    // RTX
+    _rtxV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _rtxDot = [NSView new]; _rtxDot.wantsLayer = YES; _rtxDot.layer.cornerRadius = 4;
+    [_rtxDot.widthAnchor constraintEqualToConstant:8].active = YES; [_rtxDot.heightAnchor constraintEqualToConstant:8].active = YES;
+    _rtxSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Desligada", "Off"), L("Ligada", "On"), L("Automática", "Auto")]
+                                                trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(rtx:)];
+    _rtxSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    NSStackView *rh = head(@"cpu.fill", @"RTX 4050", _rtxV); [rh insertView:_rtxDot atIndex:3 inGravity:NSStackViewGravityLeading];
+    _rtxCard = card(vstack(@[rh, _rtxSeg], 8));
+
+    // Bluetooth
+    _btV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _btPower = [NSSwitch new]; _btPower.target = self; _btPower.action = @selector(btPower:); _btPower.controlSize = NSControlSizeSmall;
+    _btAutoSw = [NSSwitch new]; _btAutoSw.target = self; _btAutoSw.action = @selector(btAuto:); _btAutoSw.controlSize = NSControlSizeSmall;
+    NSTextField *autoL = lbl(L("Desligar sem aparelhos (3 min)", "Turn off with no devices (3 min)"), 12, NSFontWeightRegular, nil);
+    // (o SF Symbol "bluetooth" nao existe; ondas de radio no lugar)
+    NSStackView *bh = hstack(@[sym(@"dot.radiowaves.left.and.right", 13, NSColor.controlAccentColor),
+                               vstack(@[lbl(@"Bluetooth", 13, NSFontWeightSemibold, nil), _btV], 1), spacer(), _btPower], 7);
+    NSBox *btCard = card(vstack(@[bh, hstack(@[autoL, spacer(), _btAutoSw], 6)], 8));
+
+    // luz do teclado
+    _kbV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _kbSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Apagada", "Off"), @"50%", @"100%"]
+                                               trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(kb:)];
+    _kbSeg.segmentDistribution = NSSegmentDistributionFillEqually;
+    NSButton *colors = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"paintpalette" accessibilityDescription:nil]
+                                          target:self action:@selector(colors:)];
+    colors.bezelStyle = NSBezelStyleRounded; colors.toolTip = L("Cores, zonas e efeitos…", "Colors, zones and effects…");
+    [colors setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSBox *kbCard = card(vstack(@[head(@"keyboard", L("Luz do teclado", "Keyboard light"), _kbV), hstack(@[_kbSeg, colors], 8)], 8));
+
+    // microfone
+    _micV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _mic = [NSSlider sliderWithValue:0 minValue:0 maxValue:NS_MAXDB target:self action:@selector(mic:)]; _mic.continuous = YES;
+    NSBox *micCard = card(vstack(@[head(@"mic", L("Supressor de ruído", "Noise suppression"), _micV), _mic], 6));
+
+    // rodape
+    _perm = [NSButton buttonWithTitle:L("Permissões", "Permissions") image:[NSImage imageWithSystemSymbolName:@"lock.shield" accessibilityDescription:nil]
+                               target:self action:@selector(perms:)];
+    NSButton *log = [NSButton buttonWithTitle:L("Log", "Log") image:[NSImage imageWithSystemSymbolName:@"doc.text" accessibilityDescription:nil]
+                                       target:self action:@selector(log:)];
+    NSButton *quit = [NSButton buttonWithTitle:L("Sair", "Quit") image:[NSImage imageWithSystemSymbolName:@"power" accessibilityDescription:nil]
+                                        target:self action:@selector(quit:)];
+    for (NSButton *b in @[_perm, log, quit]) { b.bordered = NO; b.imagePosition = NSImageLeading; b.contentTintColor = NSColor.secondaryLabelColor;
+                                               b.font = [NSFont systemFontOfSize:12]; }
+    NSStackView *foot = hstack(@[_perm, spacer(), log, quit], 14);
+
+    NSStackView *root = vstack(@[top, tiles, profCard, fanCard, _rtxCard, btCard, kbCard, micCard, foot], 8);
+    root.edgeInsets = NSEdgeInsetsMake(14, 14, 10, 14);
+    root.alignment = NSLayoutAttributeLeading;
+    for (NSView *v in root.arrangedSubviews)
+        [v.widthAnchor constraintEqualToAnchor:root.widthAnchor constant:-28].active = YES;
+    [root.widthAnchor constraintEqualToConstant:W].active = YES;
+    [root setCustomSpacing:12 afterView:top];
+    [root setCustomSpacing:4 afterView:micCard];
+
+    NSViewController *vc = [NSViewController new];
+    vc.view = root;
+    _pop = [NSPopover new];
+    _pop.contentViewController = vc; _pop.behavior = NSPopoverBehaviorTransient; _pop.animates = YES; _pop.delegate = self;
+    return self;
+}
+- (void)refresh {
+    NSDictionary *st = fanState(YES);
+    int cpu = st ? fanTemp(st, @"0x01") : -1;
+    RtxInfo r = rtxInfo(st);
+    _cpuT.stringValue = cpu >= 0 ? [NSString stringWithFormat:@"%d°", cpu] : @"--";
+    _rtxT.stringValue = r.temp >= 0 ? [NSString stringWithFormat:@"%d°", r.temp] : @"--";
+    NSNumber *rpm = [st[@"Fans"] firstObject][@"RPM"];
+    NSMutableArray *rr = [NSMutableArray array]; for (NSDictionary *f in st[@"Fans"]) if (f[@"RPM"]) [rr addObject:f[@"RPM"]];
+    int avg = 0; for (NSNumber *n in rr) avg += n.intValue; if (rr.count) avg /= (int)rr.count;
+    _rpmT.stringValue = rpm ? [NSString stringWithFormat:@"%d", avg] : @"--";
+    _rpmT.toolTip = [rr componentsJoinedByString:@" / "];
+    NSColor *rc = r.state == 2 ? NSColor.systemGreenColor : r.state == 1 ? NSColor.systemYellowColor : NSColor.systemRedColor;
+    _rtxDot.layer.backgroundColor = rc.CGColor;
+    _rtxCap.stringValue = @"RTX";
+
+    int cur = [st[@"Profile"] intValue];
+    _profIds = st ? profileRing(st) : @[];
+    if (_profSeg.segmentCount != (NSInteger)_profIds.count) {
+        _profSeg.segmentCount = MAX(1, _profIds.count);
+        for (NSUInteger i = 0; i < _profIds.count; i++) {
+            [_profSeg setImage:[NSImage imageWithSystemSymbolName:profileSymbol(_profIds[i].intValue) accessibilityDescription:nil] forSegment:i];
+            [_profSeg setLabel:@"" forSegment:i];
+            [_profSeg setToolTip:profileName(_profIds[i].intValue) forSegment:i];
+        }
+    }
+    _profSeg.selectedSegment = [_profIds indexOfObject:@(cur)] == NSNotFound ? -1 : [_profIds indexOfObject:@(cur)];
+    _profV.stringValue = st ? profileName(cur) : L("G15Fan não carregado", "G15Fan not loaded");
+    _profSeg.enabled = st != nil;
+    _sub.stringValue = st ? [NSString stringWithFormat:@"%@ · %@", profileName(cur), onAC() == 1 ? L("na tomada", "on AC") : L("na bateria", "on battery")]
+                          : L("G15Fan.kext não carregado", "G15Fan.kext not loaded");
+
+    int b = fanBoost(st);
+    NSArray *fv = @[@0, @25, @50, @75, @90, @100];
+    _fanSeg.selectedSegment = [fv indexOfObject:@(b)] == NSNotFound ? -1 : [fv indexOfObject:@(b)];
+    _fanV.stringValue = b >= 0 ? boostName(b) : @"";
+    _fanSeg.enabled = st != nil;
+
+    _rtxCard.hidden = !st[@"RtxParked"];
+    _rtxSeg.selectedSegment = rtxMode();
+    _rtxV.stringValue = [NSString stringWithFormat:@"%@%@", rtxStateName(r.state), r.state == 2 ? [NSString stringWithFormat:@" · %d%%", r.util] : @""];
+
+    _btPower.state = btOn == 1 ? NSControlStateValueOn : NSControlStateValueOff;
+    _btPower.enabled = btOn >= 0;
+    _btAutoSw.state = btAuto() ? NSControlStateValueOn : NSControlStateValueOff;
+    NSString *bs = btOn < 0 ? @"…" : btOn == 0 ? L("desligado", "off")
+                 : btConnected > 0 ? [btNames componentsJoinedByString:@", "]
+                 : btAuto() ? [NSString stringWithFormat:L("sem aparelhos · desliga em %d s", "no devices · off in %d s"), MAX(0, BT_IDLE_SECS - btIdleSecs)]
+                            : L("sem aparelhos", "no devices");
+    _btV.stringValue = bs;
+
+    _kbSeg.selectedSegment = kbLevel;
+    NSDictionary *Lt = kbLight();
+    NSArray *fxn = @[L("fixa", "static"), L("respiração", "breathing"), L("transição", "morph"), L("espectro", "spectrum"), L("onda", "wave")];
+    NSUInteger fi = [kbEffects() indexOfObject:Lt[@"effect"]];
+    _kbV.stringValue = fxn[fi == NSNotFound ? 0 : fi];
+
+    int db = nsAtten();
+    if (!_mic.highlighted) _mic.intValue = db;
+    _mic.enabled = nsWritable();
+    _micV.stringValue = db >= NS_MAXDB ? L("máximo", "max") : [NSString stringWithFormat:@"%d dB", db];
+    _micV.toolTip = nsWritable() ? L("Menos dB = voz mais natural; mais dB = silêncio mais limpo", "Fewer dB = more natural voice; more dB = cleaner silence")
+                                 : L("Rode audio/install.sh (EFI) para liberar", "Run audio/install.sh (EFI) to enable");
+
+    _perm.hidden = [prefs dictionaryForKey:@"tccDecisions"].count == 0;
+}
+- (void)popoverWillShow:(NSNotification *)n {
+    [self refresh];
+    btRead(^{ [self refresh]; });
+    _timer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self refresh]; }];
+    [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
+}
+- (void)popoverDidClose:(NSNotification *)n { [_timer invalidate]; _timer = nil; }
+- (void)profile:(NSSegmentedControl *)s { if (s.selectedSegment >= 0 && s.selectedSegment < (NSInteger)_profIds.count) applyProfile(_profIds[s.selectedSegment].intValue); [self refresh]; }
+- (void)fan:(NSSegmentedControl *)s { setBoost((int)[@[@0, @25, @50, @75, @90, @100][s.selectedSegment] intValue]); [self refresh]; }
+- (void)rtx:(NSSegmentedControl *)s { rtxSetMode((int)s.selectedSegment); [self refresh]; }
+- (void)btPower:(NSSwitch *)s { btSetPower(s.state == NSControlStateValueOn, "painel"); _btV.stringValue = @"…"; }
+- (void)btAuto:(NSSwitch *)s { [prefs setBool:s.state == NSControlStateValueOn forKey:@"btAuto"]; btIdleSecs = 0;
+                               NSLog(@"Bluetooth automatico: %s", s.state == NSControlStateValueOn ? "ligado" : "desligado"); [self refresh]; }
+- (void)kb:(NSSegmentedControl *)s { kbSet(s.selectedSegment, NO); [self refresh]; }
+- (void)colors:(id)s { [_pop performClose:nil]; kbWindowOpen(); }
+- (void)mic:(NSSlider *)sl {
+    int db = (int)lround(sl.doubleValue);
+    _micV.stringValue = db >= NS_MAXDB ? L("máximo", "max") : [NSString stringWithFormat:@"%d dB", db];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(micSave:) object:nil];
+    [self performSelector:@selector(micSave:) withObject:@(db) afterDelay:0.4 inModes:@[NSRunLoopCommonModes]];
+}
+- (void)micSave:(NSNumber *)db { nsSetAtten(db.intValue); }
+- (void)perms:(NSButton *)b {
+    NSMenu *tm = [NSMenu new];
+    NSDictionary *dec = [prefs dictionaryForKey:@"tccDecisions"];
+    for (NSString *k in [dec.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSArray *p = [k componentsSeparatedByString:@"|"];
+        [tm addItemWithTitle:[NSString stringWithFormat:@"%@: %@ (%@)", tccAppName(p.firstObject),
+                              [p.lastObject isEqualToString:@"kTCCServiceCamera"] ? L("câmera", "camera") : [p.lastObject isEqualToString:@"kTCCServiceBluetoothAlways"] ? @"Bluetooth" : L("microfone", "microphone"),
+                              [dec[k] isEqualToString:@"permitido"] ? L("permitido", "allowed") : L("negado", "denied")] action:nil keyEquivalent:@""];
+    }
+    [tm addItem:NSMenuItem.separatorItem];
+    [tm addItemWithTitle:L("Esquecer respostas (perguntar de novo)", "Forget answers (ask again)") action:@selector(forget:) keyEquivalent:@""].target = self;
+    [tm popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, b.bounds.size.height + 4) inView:b];
+}
+- (void)forget:(id)s { [prefs removeObjectForKey:@"tccDecisions"]; [tccSeen removeAllObjects]; NSLog(@"respostas de permissao esquecidas"); [self refresh]; }
+- (void)more:(NSButton *)b {
+    NSMenu *m = [NSMenu new];
+    [m addItemWithTitle:L("Abrir log", "Open log") action:@selector(log:) keyEquivalent:@""].target = self;
+    [m addItemWithTitle:L("Luz do teclado…", "Keyboard light…") action:@selector(colors:) keyEquivalent:@""].target = self;
+    [m addItem:NSMenuItem.separatorItem];
+    [m addItemWithTitle:L("Sair do G15", "Quit G15") action:@selector(quit:) keyEquivalent:@""].target = self;
+    [m popUpMenuPositioningItem:nil atLocation:NSMakePoint(0, b.bounds.size.height + 4) inView:b];
+}
+- (void)log:(id)s {
+    [_pop performClose:nil];
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/g15.log"]]];
+}
+- (void)quit:(id)s { [NSApp terminate:nil]; }
+@end
+
+static void panelToggle(NSStatusBarButton *b) {
+    if (!panel) panel = [G15Panel new];
+    if (panel.pop.shown) { [panel.pop performClose:nil]; return; }
+    [NSApp activateIgnoringOtherApps:YES];
+    [panel.pop showRelativeToRect:b.bounds ofView:b preferredEdge:NSRectEdgeMinY];
+}
 
 // ---------- teclas ----------
 // Fn+F10 = PrtSc: o VoodooPS2 manda F13 (o macOS nao usa). Captura a tela inteira como Cmd+Shift+3, na pasta dos
@@ -1362,6 +1782,28 @@ int main(int argc, const char *argv[]) {
             if (pct > 100) { fprintf(stderr, "uso: G15 [--daemon] | G15 0..100\n"); return 2; }
             kbOpen(); kbSend(pct); return 0;
         }
+        if (argc == 4 && !strcmp(argv[1], "--painel-png")) {            // teste: desenha o painel num PNG (claro|escuro)
+            PT = [NSLocale.preferredLanguages.firstObject hasPrefix:@"pt"];
+            prefs = [[NSUserDefaults alloc] initWithSuiteName:@"local.g15"];
+            [NSApplication sharedApplication];
+            NSApp.appearance = [NSAppearance appearanceNamed:!strcmp(argv[3], "escuro") ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+            btOn = 1; btConnected = 0; btIdleSecs = 45;
+            G15Panel *p = [G15Panel new];
+            NSView *v = p.pop.contentViewController.view;
+            NSVisualEffectView *bg = [NSVisualEffectView new];
+            bg.material = NSVisualEffectMaterialPopover; bg.state = NSVisualEffectStateActive; bg.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+            [p refresh];
+            NSSize sz = v.fittingSize; bg.frame = NSMakeRect(0, 0, sz.width, sz.height); v.frame = bg.bounds; [bg addSubview:v];
+            NSWindow *w = [[NSWindow alloc] initWithContentRect:bg.frame styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+            w.contentView = bg; w.appearance = NSApp.appearance; [w layoutIfNeeded];
+            for (int i = 0; i < 3; i++) { sz = v.fittingSize; [w setContentSize:sz]; bg.frame = NSMakeRect(0, 0, sz.width, sz.height); v.frame = bg.bounds; [w layoutIfNeeded]; }
+            [w display];
+            NSBitmapImageRep *rep = [bg bitmapImageRepForCachingDisplayInRect:bg.bounds];
+            [bg cacheDisplayInRect:bg.bounds toBitmapImageRep:rep];
+            [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(argv[2]) atomically:YES];
+            printf("%.0fx%.0f\n", sz.width, sz.height);
+            return 0;
+        }
         if (argc >= 2 && !strncmp(argv[1], "--", 2) && strcmp(argv[1], "--daemon")) {   // ventoinhas pela linha de comando
             kern_return_t r = KERN_SUCCESS;
             if (!strcmp(argv[1], "--perfil") && argc == 3) r = applyProfile((int)strtol(argv[2], NULL, 0)) ? KERN_SUCCESS : KERN_FAILURE;   // perfil + ventoinhas + EPP
@@ -1418,7 +1860,8 @@ int main(int argc, const char *argv[]) {
         tccStart();
         G15Menu *ui = [G15Menu new];
         ui.item = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
-        NSMenu *menu = [NSMenu new]; menu.delegate = ui; ui.item.menu = menu;
+        ui.item.button.target = ui; ui.item.button.action = @selector(clicked:);
+        [ui.item.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
 
         NSDictionary *st = fanState(YES);
         if (!st) NSLog(@"G15Fan.kext nao carregado: Fn+F9 e protecao de temperatura desligados");

@@ -12,18 +12,26 @@
 #include <sys/proc.h>
 
 static mach_vm_address_t gNaOrg = 0;
-static uint32_t gWk[5] {};
+static uint32_t gWk[6] {};   // [5] = aberturas recusadas (coletores com a RTX parada)
 static UInt32 gWkType = 0;
 static void wkPublish() { IORegistryEntry::getRegistryRoot()->setProperty("G15RtxWake", gWk, sizeof(gWk)); }
 
-static void wkEnsure() {
+// Coletores periodicos (systemstats abre o NVAccel tipo 33 a cada ~10 min): com a RTX parada, recusa em vez de religar.
+static bool wkIsCollector() {
+	char nm[24] {}; proc_selfname(nm, sizeof(nm));
+	return !strcmp(nm, "systemstats");
+}
+
+// true = recusar a abertura
+static bool wkEnsure() {
 	auto m = IOService::serviceMatching("G15Fan");
 	auto it = m ? IOService::getMatchingServices(m) : nullptr;
 	OSSafeReleaseNULL(m);
 	auto fan = it ? OSDynamicCast(IOService, it->getNextObject()) : nullptr;
 	if (fan) fan->retain();
 	OSSafeReleaseNULL(it);
-	if (!fan) return;
+	if (!fan) return false;
+	bool deny = false;
 	auto parked = OSDynamicCast(OSBoolean, fan->getProperty("RtxParked"));
 	// parada, ou acordando (NVRM ainda no estado 0): pede ao G15Fan e espera
 	bool need = parked && parked->isTrue();
@@ -34,6 +42,7 @@ static void wkEnsure() {
 		need = nv && nv->getPowerState() < 1;
 		OSSafeReleaseNULL(nv);
 	}
+	if (need && wkIsCollector() && !checkKernelArgument("-g15rtxwake-all")) { gWk[5]++; deny = true; need = false; }
 	if (need) {
 		uint32_t ms = 0;
 		auto sym = OSSymbol::withCString("G15RtxWake");
@@ -53,12 +62,14 @@ static void wkEnsure() {
 		IOLog("G15PM: RTX pedida por um programa: religada (0x%x, %u ms)\n", e, ms);
 	}
 	fan->release();
+	return deny;
 }
 
 static IOReturn naNewUC(IOService *that, task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
 	gWk[0]++; gWkType = type;
-	wkEnsure();
+	bool deny = wkEnsure();
 	wkPublish();
+	if (deny) return kIOReturnNotReady;
 	return FunctionCast(naNewUC, gNaOrg)(that, owningTask, securityID, type, handler);
 }
 

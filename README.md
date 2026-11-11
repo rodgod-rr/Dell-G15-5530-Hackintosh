@@ -37,6 +37,7 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
     `-g15fan-rtxpm-corte`.
   - Turning it back on calls `GONN`, and NullMoth resumes in about 1.2 s.
   - `G15PM` hooks `NVAccel::newUserClient`, so an app that opens the RTX turns it back on first and waits for it.
+    macOS `systemstats` is refused while the RTX is off (it opened the RTX every ~10 min just to read stats).
   - G15.app has an "RTX ( Desligada | Ligada | Automática )" selector (off / on / auto). Auto turns the RTX off after
     30 s idle on battery or 3 min on AC, and back on when the charger is plugged in. The menu bar shows "RTX" in red
     when it is off, with the temperature from the EC sensor.
@@ -46,6 +47,7 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - While it is off, the RTX cannot see an HDMI cable. Pick "Ligada" before connecting one.
 - **Sleep (Deep Idle / S0, since the firmware has no S3).** Sleep and wake work, and the panel comes back every time.
   - Tested with 5 RTC cycles in a row, idle sleep, lid-close sleep, and 1 h 44 min on battery.
+  - Overnight on battery (5 h 15 min, lid closed): package in PC10 ~100% of the time, about 0.9-1.0 W (~2 %/h).
   - **Wake sources:** lid, internal keyboard, touchpad, power button, USB.
   - The fix needs three pieces: my WhateverXe fork, `SSDT-DeepIdle` and `SSDT-LIDWAKE`.
   - The RTX is powered off during sleep by `G15Fan` + `SSDT-RTXKEXT` (ACPI `PG01._OFF`).
@@ -57,9 +59,15 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - Live Text / Vision.
   - Apple Music with FairPlay.
   - The VA driver needs patches; see Post-install.
+- **UHD RC6 (since 2026-11-11).** With the MacBookPro16,1 SMBIOS, AGPM applies a profile made for 9th-gen graphics whose
+  `RCxControl`/`CPGControl` blocks stopped RC6 about 60 s after boot (GT stuck in C0, no package C-states).
+  `G15AGPMIgpu.kext` (no code) re-injects the same AGPM profile without those two blocks: RC6 back to ~87% idle
+  ([WhateverXe#87](https://github.com/b00t0x/WhateverXe/issues/87)).
 - **Audio:** internal speakers with volume and mute, and the internal microphone (DMIC) with DeepFilterNet3 noise
   suppression. This is `AudShim` + the `XeSpeakers` HAL plug-in.
 - **Connectivity:** Wi-Fi (AirportItlwm), Bluetooth, Ethernet (RTL8111) and USB.
+  - Bluetooth on keeps the package at PC2 while awake (about +5 W). G15.app turns Bluetooth off after 3 min with
+    no device connected (it asks for the Bluetooth permission once). In sleep it does not matter.
 - **Input:** keyboard via VoodooPS2, touchpad via VoodooI2C in GPIO interrupt mode, keyboard backlight (AW-ELC), and the
   Fn keys F5 / F9 / F10 through G15.app.
 - **Keyboard lighting (G15.app → "Luz do teclado…"):** a window with a drawing of the keyboard and a live preview.
@@ -190,6 +198,7 @@ Know what that means for your security.
     - `G15Fan`: fans and profiles via Dell WMAX, RTX power cut in sleep, EC wake arming.
     - `G15PM`: the XE-PM part of NootedGreen as its own Lilu plug-in, for HWP, turbo, C-states and EPP.
     - `AudShim`: speakers and DMIC.
+    - `G15AGPMIgpu`: AGPM profile for the UHD without `RCxControl`/`CPGControl` (RC6, see "What works").
   - Sources are in `src/`.
 
 NullMoth (the RTX driver) is not in the EFI. Its installer puts it in `/Library/Extensions`.
