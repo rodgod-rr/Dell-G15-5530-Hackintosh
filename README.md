@@ -107,10 +107,14 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
-- **Rare UHD hang (under investigation).** A few times the UHD stopped scheduling work (`gpuRestart`), the screen went
-  black and WindowServer was killed by its watchdog; most cases came right after the RTX was powered back on. The
-  WhateverXe fork now logs the scheduler state on every GPU reset (`log show --predicate 'eventMessage CONTAINS
-  "G15-gpureset"'`) to find the cause.
+- **UHD hang (under investigation).** Since RC6 came back, the UHD sometimes stops answering the last submission on
+  the render engine (`gpuRestart`), the screen goes black and WindowServer is killed by its watchdog. The WhateverXe
+  fork now keeps render forcewake while the render engine executes (candidate fix, on by default) and writes each
+  hang to `/private/var/log/g15-uhd-hang-*.txt`. The boot-arg `wexg15unstick=31` also tries to recover a stuck queue.
+- **eDP Panel Self Refresh (optional, experimental).** The boot-arg `wexg15psr=3` turns on PSR1 for the internal LG
+  panel: with a still screen the package drops from about 2.05 W to 1.17 W. It once froze WindowServer with a still
+  screen (possibly the same problem as the hang above), so it is off unless you add the boot-arg. The mode can be
+  changed at runtime with `sudo sysctl debug.g15psr=0` (off) or `=3`.
 - **Rare flicker** at the bottom of translucent windows when the UHD is heavily loaded. Turning on Reduce Transparency
   hides it.
 - **Camera/microphone permissions:** with AMFI relaxed, macOS never shows the permission prompt for third-party apps.
