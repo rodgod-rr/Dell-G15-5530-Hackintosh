@@ -272,5 +272,6 @@ Sources for everything in `prebuilt/` are in `src/`. To rebuild:
 [JulioNectar's XPS 13 Plus project](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe) (AudShim origin),
 [Dortania](https://dortania.github.io/OpenCore-Install-Guide/).
 Each component keeps its own license. AudShim is under the "Thou Shalt Not Profit" license (see `src/AudShim`).
+WhateverXe.kext embeds the Intel ADL-S display microcontroller firmware (`adls_dmc_ver2_01.bin` from linux-firmware), redistributed under the Intel license in [`LICENSE.i915`](LICENSE.i915).
 
 Built with a lot of help from Claude (Anthropic). Use at your own risk.
