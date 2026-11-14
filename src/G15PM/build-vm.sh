@@ -18,7 +18,7 @@ echo "SDK: $SDK"
 NAME=G15PM; BID=local.g15.G15PM; VER=1.0.0
 FLAGS=(-arch x86_64 -mkernel -nostdinc -fno-builtin -fno-common -fno-stack-protector -mmacosx-version-min=13.0 -mmmx -msse -msse2
        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DPRODUCT_NAME=$NAME -DMODULE_VERSION=$VER
-       -isystem $SDK/Headers -I$LILU -O2 -g)
+       -isystem $SDK/Headers -I$LILU -I$R/kexts/common -O2 -g)
 cat > info.c <<EOC
 #include <mach/mach_types.h>
 #include <mach/kmod.h>

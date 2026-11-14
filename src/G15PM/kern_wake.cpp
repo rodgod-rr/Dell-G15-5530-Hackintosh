@@ -10,6 +10,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <sys/proc.h>
+#include "g15_filelog.hpp"
 
 static mach_vm_address_t gNaOrg = 0;
 static uint32_t gWk[7] {};   // [5] = aberturas recusadas (coletores com a RTX parada), [6] = deixadas sem religar (RtxLazy)
@@ -74,7 +75,7 @@ static bool wkEnsure() {
 		gWk[5]++; deny = true; need = false;
 		wkRecord(gDenyWho, "G15RtxDenyWho");
 		char nm[24] {}; proc_selfname(nm, sizeof(nm));
-		IOLog("G15PM: RTX parada, abertura de %s recusada (perfil Bateria)\n", nm);
+		g15fl::logf("G15PM: RTX parada, abertura de %s recusada (perfil Bateria)", nm);
 	}
 	if (need && gWkLazy && (gWkType & 0xFFFF0000u) != 0x4E560000u) {   // so listando as placas: nao religa
 		gWk[6]++; need = false;
@@ -88,7 +89,7 @@ static bool wkEnsure() {
 		gWk[1]++; gWk[2] = ms;
 		wkRecord(gWho, "G15RtxWakeWho");             // quem religou a RTX
 		if (e != kIOReturnSuccess || ms == 0xFFFFFFFF) gWk[3]++;
-		IOLog("G15PM: RTX pedida por um programa: religada (0x%x, %u ms)\n", e, ms);
+		g15fl::logf("G15PM: RTX pedida por um programa: religada (0x%x, %u ms)", e, ms);
 	}
 	fan->release();
 	return deny;
@@ -111,11 +112,11 @@ void rtxWakeInstall() {
 	lilu.onKextLoadForce(&gNa, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 		if (!gNa.loadIndex || index != gNa.loadIndex) return;
 		mach_vm_address_t fn = patcher.solveSymbol(index, "__ZN7NVAccel13newUserClientEP4taskPvjPP12IOUserClient", address, size);
-		if (!fn) { gWk[4] = 2; patcher.clearError(); wkPublish(); IOLog("G15PM: NVAccel::newUserClient nao achado\n"); return; }
+		if (!fn) { gWk[4] = 2; patcher.clearError(); wkPublish(); g15fl::logf("G15PM: NVAccel::newUserClient nao achado"); return; }
 		gNaOrg = patcher.routeFunction(fn, reinterpret_cast<mach_vm_address_t>(naNewUC), true);
 		if (patcher.getError() != KernelPatcher::Error::NoError) { gNaOrg = 0; gWk[4] = 3; patcher.clearError(); }
 		else gWk[4] = 1;
 		wkPublish();
-		IOLog("G15PM: gancho do NVAccel::newUserClient %s\n", gWk[4] == 1 ? "instalado" : "FALHOU");
+		g15fl::logf("G15PM: gancho do NVAccel::newUserClient %s", gWk[4] == 1 ? "instalado" : "FALHOU");
 	});
 }

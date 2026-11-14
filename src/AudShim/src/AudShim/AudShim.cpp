@@ -400,6 +400,10 @@ enum : uint32_t {
     kF5Link = 1u << 13, // DMA do link HDA preparado (LOSIDV + PPLC tag/formato)
     kF5LRun = 1u << 14, // DMA do link HDA com RUN
     kF5Codec = 1u << 15,// conversores do codec ligados no stream 1 (o rollback poe o pino no mudo e desliga)
+    // G15 P2: microfone do fone (ADC 0x08 do codec, DMA do link HDA de entrada, tag 1)
+    kF5CLink = 1u << 16,// DMA do link HDA de entrada preparado (PPLC do stream de entrada 0, tag/formato)
+    kF5CLRun = 1u << 17,// DMA do link HDA de entrada com RUN
+    kF5HsCodec = 1u << 18,// ADC 0x08 no stream 1 e modo headset ligado (o rollback desliga e volta ao modo sem headset)
 };
 // RT1316 SDCA controls used by the rollback (rt1316-sdw.h, SDW_SDCA_CTL sdw_registers.h:335-342)
 static const uint32_t kRtPde23 = 0x41001888, kRtPde27 = 0x41001908, kRtPde22 = 0x41001988;
@@ -593,9 +597,28 @@ public:
     // G15: codec HDA (Immediate Command) e DMA do link HDA do stream de reproducao
     void g15Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o);
     uint32_t g15Pplc() { return (ppOff && iss && oss) ? ppOff + 0x10 + 0x10 * (iss + oss) + 0x10 * clIdx : 0xFFFFFFFFu; }
+    uint32_t g15PplcIn() { return (ppOff && iss && oss) ? ppOff + 0x10 + 0x10 * (iss + oss) + 0x10 * icIdx : 0xFFFFFFFFu; }   // P2
     bool g15Verbs(const uint32_t *v, uint32_t n, uint32_t step);
     bool g15StartSeq();
     bool g15StopSeq();
+    // P2 (0.9.3): fone no pino 0x21. Pin sense lido no start (sem debounce) e a cada tick do drvTimer com o som tocando
+    // (3 leituras iguais para trocar); so um dos pinos 0x14/0x21 fica sem mudo. Propriedade HeadphonesPlugged no registro.
+    void g15Jack(bool force);
+    bool g15JackApply(bool in);
+    // P2 etapa 2: captura pelo microfone do fone (pipeline 2 do Linux, HDA1.IN) quando ha fone no 0x21; senao o DMIC
+    bool g15DmicCapStart();
+    bool g15DmicCapStop();
+    bool g15HsCapStart();
+    bool g15HsCapStop();
+    bool g15HsMode(bool on);
+    bool g15VerbList(const uint32_t *v, uint32_t n);
+    bool hsMicOff = false;       // boot-arg -audshimnohsmic
+    bool capHs = false;          // a captura em curso (ou a ultima) e a do fone
+    uint32_t hsType = 0;         // 0 nao detectado, 1 CTIA, 2 OMTP
+    uint32_t hsCoef46 = 0;
+    bool drvHp = false;
+    bool drvHpKnown = false;
+    uint8_t drvHpCnt = 0;
     bool g15CapStart();
     bool g15CapStop();
     // M7 helpers
@@ -813,6 +836,7 @@ bool AudShim::start(IOService *provider) {
         if (PE_parse_boot_argn("audshimcapdb", &cap, sizeof cap) && cap > 20) cap = 20;
         drvCapDb = cap; drvCapQ16 = kCapQ16[cap];
         drvVerbose = PE_parse_boot_argn("-audshimverbose", dummy, sizeof dummy);
+        hsMicOff = PE_parse_boot_argn("-audshimnohsmic", dummy, sizeof dummy);   // P2: so o DMIC, mesmo com fone
         uint32_t lg = 5000;
         if (PE_parse_boot_argn("audshimlingerms", &lg, sizeof lg) && lg > 60000) lg = 60000;
         drvLingerMs = lg;
@@ -839,6 +863,7 @@ bool AudShim::start(IOService *provider) {
     setProperty("IOUserClientClass", "AudShimUserClient");
     setProperty("AudShimInterface", AUDSHIM_IFACE_VERSION, 32);
     setProperty("AudShimCapDb", drvCapDb, 32);
+    setProperty("HeadphonesPlugged", false);   // P2: atualizado pelo g15JackApply (pin sense do 0x21)
     // M6: notification servicing timer (DSP->host messages, DMA error bits) while RUNNING
     drvWl = IOWorkLoop::workLoop();
     if (drvWl) {
@@ -1512,11 +1537,13 @@ bool AudShim::w0Allowed(uint32_t off, unsigned width) {
             off == spbOff + 0x08 + 0x08 * clIdx || off == 0x1030) return true;   // GCTL PPCTL SPBFCCTL SPIB EM2
         if (off == spbOff + 0x08 + 0x08 * icIdx) return true;                    // M7: SPIB(SD0, capture stream) = 0
         if (off == 0x60 || off == g15Pplc()) return true;                        // G15: IC (verbo), PPLCCTL do link
+        if (off == g15PplcIn()) return true;                                     // G15 P2: PPLCCTL do link de entrada
         if (mlOff && off == mlOff + 0x40 + 0x04) return true;                    // G15: LCTL do link HDA (SPA)
         return rel == 0x00 || rel == 0x08 || rel == 0x18 || rel == 0x1C;          // SD CTL CBL BDLPL BDLPU
     case 16:
         if (off == 0x0E) return true;                                            // WAKESTS/STATESTS
         if (off == 0x68 || off == g15Pplc() + 0x04) return true;                 // G15: IRS, PPLCFMT
+        if (off == g15PplcIn() + 0x04) return true;                              // G15 P2: PPLCFMT do link de entrada
         if (mlOff && off == mlOff + 0x40 + 0x08) return true;                    // G15: LOSIDV do link HDA
         return rel == 0x0C || rel == 0x12;                                       // SD LVI, FORMAT
     case 8:
@@ -2757,7 +2784,7 @@ bool AudShim::m5IpcCheck(uint8_t *m, uint32_t len, const char **why) {
         uint32_t t = *(uint32_t *)(m + 8), idx = *(uint32_t *)(m + 12);
         *why = "DAI_CONFIG for something else than ALH 0x100/0x200/0x0, DMIC 0 or HDA 0";
         if (t == 2) return idx == 0;   // G15: DMIC0 (PDM do DSP; os parametros vem da topologia, copiados do Linux)
-        if (t == 3) return idx == 0;   // G15: HDA0 (link HDA -> codec ALC3204; link_dma_ch 0 = stream tag 1)
+        if (t == 3) return idx == 0 || idx == 1;   // G15: HDA0 (alto-falantes/fone) e HDA1 (P2: microfone do fone), link_dma_ch 0 = tag 1
         return t == 4 && (idx == 0x100 || idx == 0x200 || idx == 0x000);   // M7: 0x0 = link 0 PDI 2 (RT714)
     }
     case 0x60000000u:   // SOF_IPC_GLB_STREAM_MSG
@@ -2765,7 +2792,8 @@ bool AudShim::m5IpcCheck(uint8_t *m, uint32_t len, const char **why) {
             if (len != 12) return false;
             if (typ == 0x00040000u) {
                 *why = "TRIG_START before the host stream is prepared";
-                if (*(uint32_t *)(m + 8) == kDrvCapHostComp || *(uint32_t *)(m + 8) == kG15DmicHostComp)
+                if (*(uint32_t *)(m + 8) == kDrvCapHostComp || *(uint32_t *)(m + 8) == kG15DmicHostComp ||
+                    *(uint32_t *)(m + 8) == kG15HsHostComp)
                     return (m5Flags & kF5CPrep) != 0;   // M7: capture PCM (G15: host do DMIC)
                 return (m5Flags & kF5Prep) != 0;
             }
@@ -2773,7 +2801,8 @@ bool AudShim::m5IpcCheck(uint8_t *m, uint32_t len, const char **why) {
         }
         if (typ == 0x00010000u && len == 108 && *(uint32_t *)(m + 56) == 1) {   // M7: capture PCM_PARAMS
             *why = "capture PCM_PARAMS: not the capture host comp / ext data / no capture ring";
-            if ((*(uint32_t *)(m + 8) != kDrvCapHostComp && *(uint32_t *)(m + 8) != kG15DmicHostComp) || !(m5Flags & kF5CDma) ||
+            if ((*(uint32_t *)(m + 8) != kDrvCapHostComp && *(uint32_t *)(m + 8) != kG15DmicHostComp &&
+                 *(uint32_t *)(m + 8) != kG15HsHostComp) || !(m5Flags & kF5CDma) ||
                 *(uint16_t *)(m + 88) != 0) return false;
             if ((m7Iova + kM5PtOff) >> 32) { *why = "capture page table above 4 GiB"; return false; }
             *(uint32_t *)(m + 32) = (uint32_t)(m7Iova + kM5PtOff);
@@ -2902,8 +2931,18 @@ uint32_t AudShim::m5Rollback() {
         m5Flags &= ~kF5Run;
     }
     // G15: DMA do link HDA parado e solto (reset do PPLC, LOSIDV), codec com o pino dos alto-falantes no mudo
-    if (map0w && (m5Flags & (kF5Link | kF5LRun | kF5Codec))) {
+    if (map0w && (m5Flags & (kF5Link | kF5LRun | kF5Codec | kF5CLink | kF5CLRun | kF5HsCodec))) {
         uint64_t o[16] = {};
+        if (m5Flags & (kF5CLink | kF5CLRun)) {   // P2: DMA do link de entrada
+            m5Flags &= ~kF5CLRun;
+            g15Op(kG15OpLink, 7, 0, o); nw += 4;
+            if (o[0] != kM2Ok) rc |= 1;
+        }
+        if (m5Flags & kF5HsCodec) {   // P2: ADC desligado e o codec de volta ao modo sem headset
+            for (uint32_t i = 0; i < sizeof kG15HsCodecOff / sizeof kG15HsCodecOff[0]; i++) { g15Op(kG15OpVerb, kG15HsCodecOff[i], 0, o); nw++; }
+            for (uint32_t i = 0; i < sizeof kG15HsUnplug / sizeof kG15HsUnplug[0]; i++) { g15Op(kG15OpVerb, kG15HsUnplug[i], 0, o); nw++; }
+            m5Flags &= ~kF5HsCodec;
+        }
         if (m5Flags & (kF5Link | kF5LRun)) {
             m5Flags &= ~kF5LRun;
             g15Op(kG15OpLink, 3, 0, o); nw += 4;
@@ -3765,6 +3804,12 @@ void AudShim::drvTimerFired(OSObject *owner, IOTimerEventSource *sender) {
     if (s->drvState != kDrvStRunning && s->capState != kCapStRunning) return;
     if (IOLockTryLock(s->drvLock)) {   // never wait behind a start/stop/volume sequence
         if (s->drvState == kDrvStRunning || s->capState == kCapStRunning) s->drvService();
+        if (kG15 && (s->drvState == kDrvStRunning || s->capState == kCapStRunning)) {   // P2: pin sense do fone
+            s->drvKSrc = true;
+            gQuiet = !s->drvVerbose;
+            s->g15Jack(false);
+            s->drvKSrc = false;
+        }
         if (s->drvState == kDrvStRunning && s->drvLinger && nowUs() >= s->drvLingerUntil) {
             s->drvKSrc = true;
             gQuiet = !s->drvVerbose;
@@ -3779,7 +3824,7 @@ void AudShim::drvTimerFired(OSObject *owner, IOTimerEventSource *sender) {
 void AudShim::drvFillState(uint64_t *o) {
     o[1] = drvState; o[2] = drvFailStep; o[3] = drvFailCode; o[4] = drvGainApplied; o[5] = drvCapQ16; o[6] = drvCapDb;
     o[7] = drvStarts; o[8] = drvXruns; o[9] = drvNotes; o[10] = drvDmaErr; o[11] = drvBringUps; o[12] = drvLastUpMs;
-    o[13] = drvGainReq | ((uint64_t)(drvMuted ? 1 : 0) << 32); o[14] = drvSuspended | ((uint64_t)(drvLinger ? 1 : 0) << 1);
+    o[13] = drvGainReq | ((uint64_t)(drvMuted ? 1 : 0) << 32); o[14] = drvSuspended | ((uint64_t)(drvLinger ? 1 : 0) << 1) | ((uint64_t)(drvHp ? 1 : 0) << 2);
     o[15] = AUDSHIM_IFACE_VERSION;
 }
 
@@ -3794,6 +3839,30 @@ void AudShim::drvOp(AudShimUserClient *c, uint64_t op, uint64_t a0, uint64_t *o)
         if (op != kDrvOpCapState) capOp(c, op, o);
         drvKSrc = false;
         capFillState(c, o);
+        IOLockUnlock(drvLock);
+        return;
+    }
+    if (op == kDrvOpReg) {   // 0.9.5 G15: leitura de um registrador do BAR0 (diagnostico)
+        if (drvState != kDrvStReady && drvState != kDrvStRunning) o[0] = kDrvErrNotReady;
+        else if (!map0 || (a0 & 3) || a0 + 4 > map0->getLength()) o[0] = kDrvErrBadOp;
+        else {
+            IOLockLock(m2Lock);
+            o[1] = r0((uint32_t)a0); o[2] = ppOff; o[3] = iss | (oss << 8) | (icIdx << 16) | (clIdx << 24); o[4] = mlOff;
+            IOLockUnlock(m2Lock);
+        }
+        drvKSrc = false;
+        IOLockUnlock(drvLock);
+        return;
+    }
+    if (op == kDrvOpVerb) {   // v10 G15: one raw verb to codec 0 (diagnostic), only while the link/codec are up
+        if (!kG15) o[0] = kDrvErrBadOp;
+        else if (drvState != kDrvStReady && drvState != kDrvStRunning) o[0] = kDrvErrNotReady;
+        else {
+            uint64_t v[16];
+            uint64_t r = drvCall(kG15OpVerb, a0 & 0xFFFFFFFFu, 0, v);
+            o[0] = r == kM2Ok ? kDrvOk : kDrvErrFailed; o[1] = v[1]; o[2] = v[2]; o[3] = r;
+        }
+        drvKSrc = false;
         IOLockUnlock(drvLock);
         return;
     }
@@ -4135,6 +4204,46 @@ void AudShim::g15Op(uint64_t op, uint64_t a0, uint64_t a1, uint64_t *o) {
         o[0] = ok ? kM2Ok : kM2Timeout;
         return;
     }
+    // kG15OpLink, a0 4..7: o mesmo para o DMA do link HDA de ENTRADA (P2, microfone do fone): stream de entrada icIdx, tag 1.
+    // Na captura o Linux nao mexe no LOSIDV (hda_link_dma_hw_params so o usa na reproducao); o ADC 0x08 do codec vai no stream 1.
+    if (a0 >= 4) {
+        uint32_t pc = g15PplcIn();
+        if (pc == 0xFFFFFFFFu) { o[0] = kM2Precond; return; }
+        auto creset = [&]() -> bool {
+            w0(pc, r0(pc) & ~2u, 32, "G15 PPLC(in) RUN=0");
+            w0(pc, r0(pc) | 1u, 32, "G15 PPLC(in) STRST=1");
+            bool a = poll0(pc, 1, 1, 2000, 3, &v, &el);
+            w0(pc, r0(pc) & ~1u, 32, "G15 PPLC(in) STRST=0");
+            bool b = poll0(pc, 1, 0, 2000, 3, &v, &el);
+            return a && b;
+        };
+        if (a0 == 4) {
+            if (!(m5Flags & kF5CPrep) || (m5Flags & (kF5CLink | kF5CLRun))) { o[0] = kM2Precond; o[15] = m5Flags; return; }
+            bool ok = creset();
+            w0(pc, (r0(pc) & ~(0xFu << 20)) | (kM5Tag << 20), 32, "G15 PPLC(in) tag 1");
+            w0(pc + 0x04, kG15LinkFmt, 16, "G15 PPLC(in) FMT 0x0031 (48k 24 bits 2 ch)");
+            m5Flags |= kF5CLink;
+            o[1] = r0(pc); o[2] = r0(pc + 0x04) & 0xFFFF; o[4] = pc;
+            if (!ok) o[1] = r0(pc);
+            bool verify = ((o[1] >> 20) & 0xF) == kM5Tag && o[2] == kG15LinkFmt;
+            o[0] = !ok ? kM2Timeout : verify ? kM2Ok : kM2Verify;
+        } else if (a0 == 5) {
+            if (!(m5Flags & kF5CLink)) { o[0] = kM2Precond; o[15] = m5Flags; return; }
+            w0(pc, r0(pc) | 2u, 32, "G15 PPLC(in) RUN=1");
+            m5Flags |= kF5CLRun;
+            o[1] = r0(pc); o[0] = kM2Ok;
+        } else if (a0 == 6) {
+            w0(pc, r0(pc) & ~2u, 32, "G15 PPLC(in) RUN=0");
+            m5Flags &= ~kF5CLRun;
+            o[1] = r0(pc); o[0] = kM2Ok;
+        } else if (a0 == 7) {
+            if (m5Flags & kF5CLRun) { o[0] = kM2Precond; o[15] = m5Flags; return; }
+            bool ok = creset();
+            m5Flags &= ~kF5CLink;
+            o[1] = r0(pc); o[0] = ok ? kM2Ok : kM2Timeout;
+        } else o[0] = kM2BadOp;
+        return;
+    }
     // kG15OpLink
     uint32_t pl = g15Pplc(), ml = mlOff ? mlOff + 0x40 : 0, tagBit = 1u << kM5Tag;
     if (pl == 0xFFFFFFFFu || !ml) { o[0] = kM2Precond; return; }
@@ -4186,6 +4295,86 @@ bool AudShim::g15Verbs(const uint32_t *v, uint32_t n, uint32_t step) {
     return true;
 }
 
+// P2: le o pin sense do 0x21 (Get Pin Sense 0xF09, bit 31 = presenca; o ALC3204 nao pede Execute Pin Sense).
+// force: aplica ja (start); senao so troca depois de 3 leituras seguidas diferentes do estado atual (150 ms).
+// Com o som ligado tambem acerta os pinos de saida; com a captura ligada troca o microfone (fone <-> DMIC) quando muda.
+void AudShim::g15Jack(bool force) {
+    uint64_t o[16];
+    if (drvCall(kG15OpVerb, 0x021F0900, 0, o) != kM2Ok) return;
+    bool in = (o[1] >> 31) & 1;
+    if (!force && drvHpKnown) {
+        if (in == drvHp) { drvHpCnt = 0; return; }
+        if (++drvHpCnt < 3) return;
+    }
+    drvHpCnt = 0;
+    bool changed = !drvHpKnown || in != drvHp;
+    bool ok = (m5Flags & kF5Codec) ? g15JackApply(in) : true;
+    drvHp = in; drvHpKnown = true;
+    if (changed) {
+        setProperty("HeadphonesPlugged", in);
+        if (!in) setProperty("HeadsetMicActive", false);   // so volta a Yes na proxima captura que medir um headset
+        IOLog("AudShim: fone %s%s\n", in ? "conectado" : "desconectado", ok ? "" : " (algum verbo sem resposta)");
+    }
+    if (changed && capState == kCapStRunning && capHs != in) {   // P2: troca o microfone com a captura rodando
+        IOLog("AudShim: microfone -> %s\n", in ? "fone" : "interno (DMIC)");
+        g15CapStop();
+        if (!g15CapStart()) { uint32_t st = capFailStep, code = capFailCode; g15CapStop(); capFailStep = st; capFailCode = code; capState = kCapStFailed; }
+    }
+}
+
+bool AudShim::g15JackApply(bool in) {
+    // fone: mudo no 0x14; 0x21 com pin-ctl OUT|HP (0xc0), EAPD e amp 0 dB. Alto-falante: o contrario.
+    static const uint32_t hp[] = { 0x0143a080, 0x01439080, 0x021707c0, 0x02170c02, 0x02139000, 0x0213a000 };
+    static const uint32_t spk[] = { 0x0213a080, 0x02139080, 0x01439000, 0x0143a000 };
+    const uint32_t *v = in ? hp : spk;
+    uint32_t n = in ? sizeof hp / sizeof hp[0] : sizeof spk / sizeof spk[0];
+    return g15VerbList(v, n);
+}
+
+// Verbos ao codec sem drvFail (best effort): false se algum ficou sem resposta.
+bool AudShim::g15VerbList(const uint32_t *v, uint32_t n) {
+    uint64_t o[16];
+    bool ok = true;
+    for (uint32_t i = 0; i < n; i++) if (drvCall(kG15OpVerb, v[i], 0, o) != kM2Ok) ok = false;
+    return ok;
+}
+
+// P2: modo headset do ALC236/256 como o Linux (patch_realtek.c alc_determine_headset_type + alc_headset_mode_ctia/omtp):
+// modo mic-in, 80 ms, le o coeficiente 0x46 ((v & 0x70) == 0x70 -> CTIA), e liga o modo do tipo achado. off: o modo sem
+// headset que o Linux poe no init (alc_headset_mode_unplugged), o mesmo estado do kG15CodecInit (0x46 = 0x0004).
+bool AudShim::g15HsMode(bool on) {
+    if (!on) return g15VerbList(kG15HsUnplug, sizeof kG15HsUnplug / sizeof kG15HsUnplug[0]);
+    uint64_t o[16];
+    // 14/11 (0.9.7): como o Linux, o fone (0x21) fica mudo e com o pino desligado durante a medida, e a leitura do 0x46
+    // espera 300 ms depois de 0x45=d089/0x49=0149. Antes media com o fone tocando e 80 ms: com som tocando dava OMTP para
+    // um headset CTIA e o "mic" gravava o terra do fone (o som que estava tocando).
+    uint32_t hpCtl = 0xC0, hpMute = 0;
+    if (drvCall(kG15OpVerb, 0x021F0700, 0, o) == kM2Ok) hpCtl = (uint32_t)o[1] & 0xFF;
+    if (drvCall(kG15OpVerb, 0x021BA000, 0, o) == kM2Ok) hpMute = (uint32_t)o[1] & 0x80;
+    if (!g15VerbList(kG15HsDetect1, 6)) return false;                      // 0x1b, 0x06, 0x57.3
+    drvCall(kG15OpVerb, 0x0213B080, 0, o);                                 // 0x21 saida muda
+    IOSleep(80);
+    drvCall(kG15OpVerb, 0x02170700, 0, o);                                 // 0x21 pino desligado
+    // daqui ate a volta do 0x21 nada retorna antes: uma falha no meio deixava o fone mudo e sem pino
+    bool d1 = g15VerbList(kG15HsDetect1 + 6, sizeof kG15HsDetect1 / sizeof kG15HsDetect1[0] - 6);   // 0x45, 0x49
+    IOSleep(300);
+    bool rd = d1 && drvCall(kG15OpVerb, 0x02050046, 0, o) == kM2Ok && drvCall(kG15OpVerb, 0x020C0000, 0, o) == kM2Ok;
+    if (rd) {
+        hsCoef46 = (uint32_t)o[1];
+        // 14/11 (0.9.9), medido no G15: headset CTIA 0x00f4, fone sem mic (3 contatos) 0x0004 -> 0x70 inteiro = CTIA,
+        // nenhum bit = sem mic (o anel do mic esta no terra), parcial = OMTP
+        hsType = ((hsCoef46 & 0x70) == 0x70) ? 1 : (hsCoef46 & 0x70) ? 2 : 3;
+    }
+    bool d2 = g15VerbList(kG15HsDetect2, sizeof kG15HsDetect2 / sizeof kG15HsDetect2[0]);
+    drvCall(kG15OpVerb, 0x02170700 | hpCtl, 0, o);                         // 0x21 pino de volta
+    IOSleep(80);
+    drvCall(kG15OpVerb, 0x0213B000 | hpMute, 0, o);                        // 0x21 mudo como estava
+    if (!rd || !d2) return false;
+    if (hsType == 3) return true;   // sem mic: o chamador volta o codec ao modo sem headset
+    if (hsType == 1) return g15VerbList(kG15HsCtia, sizeof kG15HsCtia / sizeof kG15HsCtia[0]);
+    return g15VerbList(kG15HsOmtp, sizeof kG15HsOmtp / sizeof kG15HsOmtp[0]);
+}
+
 // G15 READY -> RUNNING, na ordem do Linux (hw_params: widgets + DAI_CONFIG, host stream, DMA do link, conversores do codec;
 // prepare: PCM_PARAMS; trigger START: DMA do link, DMA do host, TRIG_START). O PGA30.0 sobe com o volume pedido no fim.
 bool AudShim::g15StartSeq() {
@@ -4202,6 +4391,7 @@ bool AudShim::g15StartSeq() {
     if (drvCall(kG15OpLink, 0, 0, o) != kM2Ok) { drvFail(63, o[0], "BE hw_params: DMA do link HDA"); return false; }
     if (!g15Verbs(kG15CodecOn, sizeof kG15CodecOn / sizeof kG15CodecOn[0], 64)) return false;
     m5Flags |= kF5Codec;
+    g15Jack(true);   // P2: fone ou alto-falante antes do primeiro som
     if (!drvIpc(kG15PlayParams[0], false, 0)) { drvFail(65, drvFailCode, "STREAM_PCM_PARAMS"); return false; }
     if (drvCall(kG15OpLink, 1, 0, o) != kM2Ok) { drvFail(66, o[0], "DMA do link HDA RUN"); return false; }
     if (drvCall(kM5OpStream, 1, 0, o) != kM2Ok) { drvFail(67, o[0], "host DMA RUN"); return false; }
@@ -4255,7 +4445,107 @@ bool AudShim::g15StopSeq() {
 }
 
 // G15: microfone (DMIC0, pipeline 10), as mensagens do Linux (as mesmas do audctl dmic, G15Drv.h <- g15dmic.h).
+// P2: com fone no 0x21 a captura vai pelo microfone do fone; sem fone, pelo DMIC. -audshimnohsmic desliga o do fone.
 bool AudShim::g15CapStart() {
+    g15Jack(true);
+    bool hs = drvHp && !hsMicOff;
+    if (hs) {   // 0.9.9: mede o plugue (CTIA / OMTP / sem mic) e liga o modo headset; sem mic -> DMIC
+        m5Flags |= kF5HsCodec;
+        bool ok = g15HsMode(true);
+        if (!ok || hsType == 3) {
+            g15HsMode(false);
+            m5Flags &= ~kF5HsCodec;
+            hs = false;
+            IOLog("AudShim: fone %s (coef 0x46 = 0x%x): microfone interno\n", ok ? "sem microfone" : "sem resposta na medida", hsCoef46);
+        }
+    }
+    capHs = hs;
+    setProperty("HeadsetMicActive", hs);
+    setProperty("HeadsetType", hsType, 32);      // 1 CTIA, 2 OMTP, 3 sem mic (ultima medida)
+    setProperty("HeadsetCoef46", hsCoef46, 32);
+    return hs ? g15HsCapStart() : g15DmicCapStart();
+}
+
+bool AudShim::g15CapStop() {
+    return capHs ? g15HsCapStop() : g15DmicCapStop();
+}
+
+// P2: a ordem do Linux na gravacao pelo PCM 0 (hw_params: widgets + DAI_CONFIG HDA1, host stream, DMA do link, codec;
+// prepare: PCM_PARAMS; trigger START: DMA do link, DMA do host, TRIG_START).
+bool AudShim::g15HsCapStart() {
+    uint64_t o[16];
+    uint64_t t0 = nowUs();
+    capFailStep = 0; capFailCode = 0;
+    if (!(m5Flags & kF5CDma)) {
+        if (drvCall(kM7OpCapAlloc, 0, 0, o) != kM2Ok) { capFail(71, o[0], "capture ring"); return false; }
+        capRingGen++;
+    }
+    if (!capTopo) {
+        capTopo = true;
+        for (uint32_t i = 0; i < sizeof kG15HsSetup / sizeof kG15HsSetup[0]; i++)
+            if (!drvIpc(kG15HsSetup[i], false, 0)) {
+                capFail(86, (i << 16) | drvFailCode, kG15HsSetup[i].what);
+                uint32_t st = capFailStep, code = capFailCode;
+                for (uint32_t k = 0; k < sizeof kG15HsFree / sizeof kG15HsFree[0]; k++) drvIpc(kG15HsFree[k], false, 0);
+                capFailStep = st; capFailCode = code;
+                capTopo = false;
+                return false;
+            }
+    }
+    bzero(m7Va, kM5Buf);
+    __sync_synchronize();
+    if (drvCall(kM7OpCapStream, 0, 0, o) != kM2Ok) { capFail(74, o[0], "FE hw_params: host capture stream SD0"); return false; }
+    if (drvCall(kG15OpLink, 4, 0, o) != kM2Ok) {   // codigo: resultado | PPLC << 8 (24 bits baixos) para o audctl
+        capFail(87, o[0] | ((o[1] & 0xFFFFFF) << 8), "BE hw_params: DMA do link HDA de entrada"); return false;
+    }
+    // o modo headset ja foi medido e ligado pelo g15CapStart (kF5HsCodec)
+    if (!g15VerbList(kG15HsCodecOn, sizeof kG15HsCodecOn / sizeof kG15HsCodecOn[0])) { capFail(89, 0, "ADC 0x08 / pino 0x19"); return false; }
+    if (!drvIpc(kG15HsParams[0], false, 0)) { capFail(75, drvFailCode, "STREAM_PCM_PARAMS (fone)"); return false; }
+    if (drvCall(kG15OpLink, 5, 0, o) != kM2Ok) { capFail(90, o[0], "DMA do link HDA de entrada RUN"); return false; }
+    if (drvCall(kM7OpCapStream, 1, 0, o) != kM2Ok) { capFail(79, o[0], "capture host DMA RUN"); return false; }
+    capRunHost = mach_absolute_time();
+    OSIncrementAtomic((volatile SInt32 *)&capGen);
+    if (!drvIpc(kG15HsStart[0], false, 0)) { capFail(80, drvFailCode, "STREAM_TRIG_START (fone)"); return false; }
+    capState = kCapStRunning;
+    capStarts++;
+    if (drvTimer) drvTimer->setTimeoutMS(50);
+    IOLog("AudShim DRV: CAPTURE RUNNING (start #%u in %llu us, microfone do fone, %s, coef 0x46 = 0x%x)\n", capStarts,
+          nowUs() - t0, hsType == 1 ? "CTIA" : "OMTP", hsCoef46);
+    return true;
+}
+
+bool AudShim::g15HsCapStop() {
+    uint64_t o[16];
+    bool ok = true;
+    uint64_t t0 = nowUs();
+    bool wasRunning = capState == kCapStRunning;
+    capState = kCapStOff;
+    if (m5Flags & kF5CRun) {
+        if (!drvIpc(kG15HsStop[0], false, 0)) ok = false;
+        if (drvCall(kM7OpCapStream, 2, 0, o) != kM2Ok) ok = false;
+    }
+    if ((m5Flags & (kF5CLink | kF5CLRun)) && drvCall(kG15OpLink, 6, 0, o) != kM2Ok) ok = false;
+    if (m5Flags & kF5CPrep) {
+        if (!drvIpc(kG15HsPcmFree[0], false, 0)) ok = false;
+        if (!drvIpc(kG15HsDaiFree[0], false, 0)) ok = false;
+        if (drvCall(kM7OpCapStream, 3, 0, o) != kM2Ok) ok = false;
+    }
+    if ((m5Flags & kF5CLink) && drvCall(kG15OpLink, 7, 0, o) != kM2Ok) ok = false;
+    if (m5Flags & kF5HsCodec) {
+        if (!g15VerbList(kG15HsCodecOff, sizeof kG15HsCodecOff / sizeof kG15HsCodecOff[0])) ok = false;
+        if (!g15HsMode(false)) ok = false;
+        m5Flags &= ~kF5HsCodec;
+    }
+    if (capTopo) {
+        for (uint32_t i = 0; i < sizeof kG15HsFree / sizeof kG15HsFree[0]; i++) if (!drvIpc(kG15HsFree[i], false, 0)) ok = false;
+        capTopo = false;
+    }
+    if (wasRunning || !ok)
+        IOLog("AudShim DRV: capture (fone) stopped in %llu us%s (capture DMA errors %u)\n", nowUs() - t0, ok ? "" : " WITH ERRORS", capDmaErr);
+    return ok;
+}
+
+bool AudShim::g15DmicCapStart() {
     uint64_t o[16];
     uint64_t t0 = nowUs();
     capFailStep = 0; capFailCode = 0;
@@ -4290,7 +4580,7 @@ bool AudShim::g15CapStart() {
     return true;
 }
 
-bool AudShim::g15CapStop() {
+bool AudShim::g15DmicCapStop() {
     uint64_t o[16];
     bool ok = true;
     uint64_t t0 = nowUs();

@@ -20,6 +20,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
 #include <sys/proc.h>
+#include "g15_filelog.hpp"
 
 static mach_vm_address_t gCmftOrg, gFaultOrg, gExtOrg;
 static IOLock *gRvLock;
@@ -63,7 +64,7 @@ static void rvApply(bool on) {
 	for (unsigned i = 0; i < n; i++) { snap[i]->redirect(nullptr, on); snap[i]->release(); }
 	if (!on) gRevoked = false;
 	IOFree(snap, sizeof(IOMemoryDescriptor *) * kRvMax);
-	IOLog("G15PM: revoke %s em %u descritor(es)\n", on ? "LIGADO" : "desligado", n);
+	g15fl::logf("G15PM: revoke %s em %u descritor(es)", on ? "LIGADO" : "desligado", n);
 }
 
 static uint32_t rvWakeGpu() {                       // G15Fan religa e espera o NVRM; devolve ms
@@ -83,7 +84,7 @@ static void rvWakeAll(const char *why) {
 	uint32_t ms = rvWakeGpu();
 	gRs[5] = ms;
 	rvApply(false);
-	IOLog("G15PM: revoke: RTX religada (%s, %u ms)\n", why, ms);
+	g15fl::logf("G15PM: revoke: RTX religada (%s, %u ms)", why, ms);
 }
 
 static void rvWakeCallFn(thread_call_param_t, thread_call_param_t) {
@@ -164,7 +165,7 @@ void rtxRevokeInstall() {
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		mach_vm_address_t fn = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN18IOMemoryDescriptor11handleFaultEPvyy");
 		if (fn) gFaultOrg = patcher.routeFunction(fn, reinterpret_cast<mach_vm_address_t>(rvFault), true);
-		if (!fn || patcher.getError() != KernelPatcher::Error::NoError) { gFaultOrg = 0; patcher.clearError(); IOLog("G15PM: revoke: handleFault FALHOU\n"); }
+		if (!fn || patcher.getError() != KernelPatcher::Error::NoError) { gFaultOrg = 0; patcher.clearError(); g15fl::logf("G15PM: revoke: handleFault FALHOU"); }
 		else gRs[6] |= 2;
 		rvPublish();
 	});
@@ -179,6 +180,6 @@ void rtxRevokeInstall() {
 		if (!b || patcher.getError() != KernelPatcher::Error::NoError) { gExtOrg = 0; patcher.clearError(); }
 		else gRs[6] |= 4;
 		rvPublish();
-		IOLog("G15PM: revoke: ganchos 0x%x\n", gRs[6]);
+		g15fl::logf("G15PM: revoke: ganchos 0x%x", gRs[6]);
 	});
 }

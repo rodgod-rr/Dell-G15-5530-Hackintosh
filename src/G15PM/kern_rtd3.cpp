@@ -13,6 +13,7 @@
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IONVRAM.h>
+#include "g15_filelog.hpp"
 
 //  (10/11, 2a versao) Sequencia como a do Linux, que o AML do PG01 pressupoe (ssdt11: o _ON tira o root port de D3hot,
 //  PEG1.D3HT=0, e espera a RTX responder). _OFF: salva a config (256 B) da GPU (fn0) e do audio HDMI (fn1), poe fn1, fn0
@@ -156,7 +157,7 @@ static bool rtEval(IOACPIPlatformDevice *acpi, const char *method) {
 	const bool ok = isOff ? rtOff() : rtOn();
 	gRt[isOff ? (ok ? 0 : 1) : (ok ? 2 : 3)]++;
 	rtPublish();
-	IOLog("G15PM: RTD3 %s -> %s (passo %u)\n", method, ok ? "ok" : "falhou", gRt[6]);
+	g15fl::logf("G15PM: RTD3 %s -> %s (passo %u)", method, ok ? "ok" : "falhou", gRt[6]);
 	return ok;
 }
 
@@ -172,11 +173,11 @@ void rtd3Install() {
 	lilu.onKextLoadForce(&gNvrm, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 		if (!gNvrm.loadIndex || index != gNvrm.loadIndex) return;
 		mach_vm_address_t fn = patcher.solveSymbol(index, "__ZL10evalMethodP20IOACPIPlatformDevicePKc", address, size);
-		if (!fn) { gRt[5] = 2; patcher.clearError(); rtPublish(); IOLog("G15PM: RTD3: evalMethod do NVRM nao achado\n"); return; }
+		if (!fn) { gRt[5] = 2; patcher.clearError(); rtPublish(); g15fl::logf("G15PM: RTD3: evalMethod do NVRM nao achado"); return; }
 		gRtOrg = patcher.routeFunction(fn, reinterpret_cast<mach_vm_address_t>(rtEval), true);
 		if (patcher.getError() != KernelPatcher::Error::NoError) { gRtOrg = 0; gRt[5] = 3; patcher.clearError(); }
 		else gRt[5] = 1;
 		rtPublish();
-		IOLog("G15PM: RTD3: gancho do evalMethod do NVRM %s\n", gRt[5] == 1 ? "instalado" : "FALHOU");
+		g15fl::logf("G15PM: RTD3: gancho do evalMethod do NVRM %s", gRt[5] == 1 ? "instalado" : "FALHOU");
 	});
 }

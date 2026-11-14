@@ -32,6 +32,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
+#include "g15_filelog.hpp"
 
 extern "C" void mp_rendezvous_no_intrs(void (*fn)(void *), void *arg);
 extern "C" int cpu_number(void);
@@ -140,7 +141,7 @@ static void xpApply(thread_call_param_t, thread_call_param_t) {
 	gXpD3 += xpD3();
 	if (!gXpEet) { mp_rendezvous_no_intrs(xpEetOne, nullptr); gXpEet = (int)((xpRdmsr(0x1FC) >> 19) & 1); }
 	if (gXpOrgSetMult) gXpHwp = 1;   // takes effect at XCPM's next request on each CPU
-	IOLog("G15PM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d\n",
+	g15fl::logf("G15PM: profile on: HWP rescale %d (route %d), EPP %d, EE turbo off %d, C8/C10 %d, D3 %d",
 	      gXpHwp, gXpRoute, gXpEpp, gXpEet, gXpCst, gXpD3);
 	extern void g15pmControlPublish(); g15pmControlPublish();   // o G15PMControl pode ter publicado antes do perfil
 }
@@ -233,5 +234,5 @@ void xePmInstall(KernelPatcher &patcher) {
 	if (t20) thread_call_enter_delayed(t20, dl);
 	clock_interval_to_deadline(60, kSecondScale, &dl);
 	if (t60) thread_call_enter_delayed(t60, dl);
-	IOLog("G15PM: -g15pm, HWP route %d, idle table %s; profile in 20 s\n", gXpRoute, gXpCstPtr ? "found" : "missing");
+	g15fl::logf("G15PM: -g15pm, HWP route %d, idle table %s; profile in 20 s", gXpRoute, gXpCstPtr ? "found" : "missing");
 }

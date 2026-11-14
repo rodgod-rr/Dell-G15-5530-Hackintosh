@@ -9,6 +9,7 @@
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
+#include "g15_filelog.hpp"
 
 bool xePmActive();
 int xePmGetEpp();
@@ -54,18 +55,18 @@ public:
 			const uint32_t e = n->unsigned32BitValue();
 			if (e > 255) r = kIOReturnBadArgument;
 			else if (!xePmSetEpp((int)e)) r = kIOReturnNotReady;   // G15PM desligado (sem -g15pm)
-			IOLog("G15PM: EPP %u (%s)\n", e, r == kIOReturnSuccess ? "ok" : "erro");
+			g15fl::logf("G15PM: EPP %u (%s)", e, r == kIOReturnSuccess ? "ok" : "erro");
 		}
 		if (auto o = d->getObject("RtxDeny")) {
 			auto b = OSDynamicCast(OSBoolean, o); auto n = OSDynamicCast(OSNumber, o);
 			const bool v = b ? b->isTrue() : n ? n->unsigned32BitValue() != 0 : false;
 			rtxWakeSetDeny(v);
-			IOLog("G15PM: RtxDeny %d\n", v);
+			g15fl::logf("G15PM: RtxDeny %d", v);
 		}
 		if (auto o = d->getObject("RtxLazy")) {
 			auto b = OSDynamicCast(OSBoolean, o); auto n = OSDynamicCast(OSNumber, o);
 			rtxWakeSetLazy(b ? b->isTrue() : n ? n->unsigned32BitValue() != 0 : false);
-			IOLog("G15PM: RtxLazy %d\n", rtxWakeGetLazy());
+			g15fl::logf("G15PM: RtxLazy %d", rtxWakeGetLazy());
 		}
 		if (auto o = d->getObject("RtxRevoke")) {
 			auto b = OSDynamicCast(OSBoolean, o); auto n = OSDynamicCast(OSNumber, o);

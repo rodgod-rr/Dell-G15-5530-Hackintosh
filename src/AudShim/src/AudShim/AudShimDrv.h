@@ -15,10 +15,13 @@
 // S32_LE stereo interleaved (24 valid bits are what reaches the amps), 8192 frames. Valid while the
 // driver state is READY or RUNNING; it is a different buffer after every bring-up (map it again after
 // each successful OPEN/START that reports a new bring-up count in DRV_STATE o[11]).
+// v10 (G15, 0.9.3): registry property "HeadphonesPlugged" (bool) on the AudShim service = headphones in the 0x21 jack
+// (pin sense read at every START and every 50 ms while RUNNING, 3 equal reads to switch; kept while stopped). Only one of
+// the pins 0x14 (speakers) / 0x21 (headphones) is unmuted. The HAL plug-in polls it to name the output.
 #ifndef AUDSHIM_DRV_H
 #define AUDSHIM_DRV_H
 
-#define AUDSHIM_IFACE_VERSION 9
+#define AUDSHIM_IFACE_VERSION 10   /* v10 (G15, 0.9.3): kDrvOpVerb */
 #define AUDSHIM_IFACE_MIN_SPEAKERS 8   /* the speaker part (methods 5/6, ring 0, ops 0-5) is unchanged since v8 */
 #define AUDSHIM_DRV_CONN_TYPE 0x58454452u   /* 'XEDR' */
 #define AUDSHIM_METHOD_DRV 5
@@ -47,7 +50,8 @@ enum {
     kDrvOpState = 0,   // read-only: o[1] state o[2] fail step o[3] fail code o[4] applied gain Q16 o[5] cap Q16
                        // o[6] cap dB o[7] starts o[8] DSP xrun notifications o[9] DSP notifications o[10] host DMA
                        // errors o[11] bring-ups o[12] last bring-up ms o[13] requested gain Q16 | muted << 32
-                       // o[14] b0 suspended, b1 lingering (deferred stop pending) o[15] interface version
+                       // o[14] b0 suspended, b1 lingering (deferred stop pending), b2 (v10 G15) headphones in the 0x21 jack
+                       // o[15] interface version
     kDrvOpOpen = 1,    // bring the DSP/links/amps/pipeline up to READY (blocking, ~1-2 s); no-op if already up
     kDrvOpStart = 2,   // READY -> RUNNING (brings up first if needed): amps on, SoundWire stream, DMA, TRIG_START
     kDrvOpStop = 3,    // RUNNING -> READY: fade, TRIG_STOP, DMA stop, amps muted + PS3, SoundWire stream off.
@@ -65,6 +69,13 @@ enum {
                           // host DMA SD0, PCM_PARAMS, TRIG_START; no-op if this connection's capture already runs
     kDrvOpCapStop = 7,    // immediate stop (TRIG_STOP, DMA stop, PCM_FREE, RT714 PS3 + muted, link 0 ports off)
     kDrvOpCapState = 8,   // read-only
+    // v10 (G15): a0 = one raw HDA verb for codec 0 (diagnostic; audctl codec-verb). Any driver connection, only while the
+    // hardware is READY/RUNNING (else kDrvErrNotReady). Answered WITHOUT the state: o[1] codec response, o[2] IRS,
+    // o[3] internal result (0 = ok, else timeout/precondition).
+    kDrvOpVerb = 9,
+    // v10 (G15, 0.9.5): a0 = BAR0 offset (4-aligned); o[1] = 32-bit read, o[2] = ppOff, o[3] = iss | oss << 8 | icIdx << 16 |
+    // clIdx << 24, o[4] = mlOff (diagnostic, read-only; audctl reg-read). Only while READY/RUNNING.
+    kDrvOpReg = 10,
 };
 enum { kCapStOff = 0, kCapStRunning = 1, kCapStFailed = 2 };
 // driver states (DRV_STATE o[1], POS o[0])

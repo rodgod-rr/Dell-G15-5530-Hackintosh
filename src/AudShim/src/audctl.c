@@ -4053,6 +4053,93 @@ static int cmd_drv(int argc, char **argv) {
     return rc;
 }
 
+// ------------------------------------------------------------------ G15: verbos crus ao codec (P2, etapa 1)
+// audctl codec-verb HEX [HEX...]  manda cada verbo ao codec 0 pelo kext (kDrvOpVerb, AudShim 0.9.3) e mostra a resposta.
+// audctl codec-p2                 leituras do diagnostico do P2: pin sense, pin-ctl, EAPD e amp out de 0x21/0x14/0x19.
+// So funciona com o hardware READY/RUNNING (ex.: algo tocando ou ate ~5 s depois); sem isso: "not ready".
+static int verb1(uint32_t verb, uint32_t *resp) {
+    uint64_t o[16];
+    if (drv_call(kDrvOpVerb, verb, o)) return -1;
+    if (o[0]) { printf("0x%08x -> %s (interno %llu, IRS 0x%llx)\n", verb, drv_rc(o[0]), o[3], o[2]); return 1; }
+    *resp = (uint32_t)o[1];
+    return 0;
+}
+static int cmd_codec_verb(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "codec-verb HEX [HEX...]   (ex.: 0x021F0900 = pin sense do 0x21)\n"); return 2; }
+    if (drv_open_conn()) return 1;
+    int rc = 0;
+    for (int i = 0; i < argc; i++) {
+        uint32_t v = (uint32_t)strtoul(argv[i], NULL, 16), r = 0;
+        int e = verb1(v, &r);
+        if (e < 0) { rc = 1; break; }
+        if (e) { rc = 1; continue; }
+        printf("0x%08x -> 0x%08x\n", v, r);
+    }
+    IOServiceClose(dconn);
+    return rc;
+}
+// audctl reg-read [HEX...]: le registradores do BAR0 pelo kext (kDrvOpReg, AudShim 0.9.5). Sem argumentos: os do link HDA
+// do P2 (PPCTL, PPLC de saida e de entrada 0, LCTL/LOSIDV do link HDA, SD0 CTL/FMT).
+static int cmd_reg_read(int argc, char **argv) {
+    if (drv_open_conn()) return 1;
+    uint64_t o[16];
+    if (drv_call(kDrvOpReg, 0, o) || o[0]) { printf("reg-read: %s\n", drv_rc(o[0])); IOServiceClose(dconn); return 1; }
+    uint32_t pp = (uint32_t)o[2], iss = o[3] & 0xFF, oss = (o[3] >> 8) & 0xFF, ic = (o[3] >> 16) & 0xFF, cl = (o[3] >> 24) & 0xFF, ml = (uint32_t)o[4];
+    printf("ppOff 0x%x iss %u oss %u icIdx %u clIdx %u mlOff 0x%x\n", pp, iss, oss, ic, cl, ml);
+    uint32_t regs[24]; const char *nm[24]; int n = 0;
+    if (argc > 0) for (int i = 0; i < argc && n < 24; i++) { regs[n] = (uint32_t)strtoul(argv[i], NULL, 16); nm[n++] = ""; }
+    else {
+        uint32_t base = pp + 0x10 + 0x10 * (iss + oss);
+        regs[n] = pp + 0x04; nm[n++] = "PPCTL";
+        regs[n] = base + 0x10 * cl; nm[n++] = "PPLC saida (clIdx) CTL";
+        regs[n] = base + 0x10 * cl + 4; nm[n++] = "PPLC saida FMT";
+        for (uint32_t k = 0; k < 2 && k < iss; k++) { regs[n] = base + 0x10 * k; nm[n++] = k ? "PPLC entrada 1 CTL" : "PPLC entrada 0 CTL"; regs[n] = base + 0x10 * k + 4; nm[n++] = "  FMT"; }
+        regs[n] = pp + 0x10 + 0x10 * ic; nm[n++] = "PPHC entrada 0";
+        if (ml) { regs[n] = ml + 0x44; nm[n++] = "link HDA LCTL"; regs[n] = ml + 0x48; nm[n++] = "link HDA LOSIDV"; regs[n] = ml + 0x4C; nm[n++] = "link HDA +0x0C"; regs[n] = ml + 0x40; nm[n++] = "link HDA LCAP"; }
+        regs[n] = 0x80; nm[n++] = "SD0 CTL/STS"; regs[n] = 0x80 + 0x10; nm[n++] = "SD0 LVI/FIFOS/FMT";
+    }
+    for (int i = 0; i < n; i++) {
+        if (drv_call(kDrvOpReg, regs[i], o) || o[0]) { printf("0x%05x: %s\n", regs[i], drv_rc(o[0])); continue; }
+        printf("0x%05x = 0x%08llx  %s\n", regs[i], o[1], nm[i]);
+    }
+    IOServiceClose(dconn);
+    return 0;
+}
+static int cmd_codec_p2(void) {
+    static const struct { uint32_t v; const char *what; } q[] = {
+        {0x021F0900, "0x21 fone   pin sense (b31 presenca)"},
+        {0x019F0900, "0x19 mic P2 pin sense (b31 presenca)"},
+        {0x014F0900, "0x14 alto-f pin sense"},
+        {0x021F0700, "0x21 pin widget control (Linux 0xc0)"},
+        {0x019F0700, "0x19 pin widget control (Linux VREF_80 0x24)"},
+        {0x014F0700, "0x14 pin widget control"},
+        {0x021F0C00, "0x21 EAPD/BTL (Linux 0x2)"},
+        {0x014F0C00, "0x14 EAPD/BTL"},
+        {0x021B8000, "0x21 amp out esq (Linux 0x80 = mudo)"},
+        {0x021BA000, "0x21 amp out dir"},
+        {0x014B8000, "0x14 amp out esq"},
+        {0x014BA000, "0x14 amp out dir"},
+        {0x021F0800, "0x21 unsolicited response (b7 enable, tag)"},
+        {0x021F0100, "0x21 connection select (Linux 0x03 = idx 1)"},
+        {0x021F1C00, "0x21 config default"},
+        {0x019F1C00, "0x19 config default"},
+        {0x021F000C, "0x21 pin capabilities"},
+        {0x001F0500, "0x01 AFG power state"},
+    };
+    if (drv_open_conn()) return 1;
+    int rc = 0;
+    for (size_t i = 0; i < sizeof q / sizeof q[0]; i++) {
+        uint32_t r = 0;
+        int e = verb1(q[i].v, &r);
+        if (e < 0) { rc = 1; break; }
+        if (e) { rc = 1; continue; }
+        printf("0x%08x -> 0x%08x   %s%s\n", q[i].v, r, q[i].what,
+               (q[i].v & 0xFFFFF) == 0xF0900 ? ((r >> 31) ? "  = PRESENTE" : "  = ausente") : "");
+    }
+    IOServiceClose(dconn);
+    return rc;
+}
+
 // ------------------------------------------------------------------ M7: rec (microphones -> WAV)
 static const char *cap_st(uint64_t s) { static const char *n[] = {"OFF", "RUNNING", "FAILED"}; return s < 3 ? n[s] : "?"; }
 static void cap_print_state(const uint64_t o[16]) {
@@ -4207,6 +4294,7 @@ int main(int argc, char **argv) {
                         "       audctl tplg [PATH] [--hex] [--plan]   topology dump + generated IPC3 messages (offline)\n"
                         "       audctl gen-header [OUT.h] [--fw=PATH] [--tplg=PATH]   M6: static data header for the kext driver mode\n"
                         "       audctl drv state | open | start | stop | close | test [--seconds=N] [--level=dB]   M6: kext driver mode\n"
+                        "       audctl codec-verb HEX [HEX...] | codec-p2   G15: verbos crus ao codec (hardware READY/RUNNING)\n"
                         "       audctl dmic [OUT.wav] [--seconds=N (0.5..30, default 5)] [m3 options]   G15: grava o microfone interno (DMIC)\n"
                         "       audctl rec [OUT.wav] [--seconds=N (0.5..60, default 5)] [--dry-run [--hex] [--tplg=PATH]]   M7: microphones\n");
         return 2;
@@ -4220,7 +4308,10 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "m5a")) return cmd_boot(argc - 2, argv + 2, 4);
     if (!strcmp(argv[1], "dmic")) return cmd_dmic(argc - 2, argv + 2);                 // G15: microfone interno (DMIC)
     if (!strcmp(argv[1], "gen-header")) return cmd_genheader(argc - 2, argv + 2);   // offline (M6)
-    if (!strcmp(argv[1], "drv")) return cmd_drv(argc - 2, argv + 2);                 // M6 driver mode
+    if (!strcmp(argv[1], "drv")) return cmd_drv(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "codec-verb")) return cmd_codec_verb(argc - 2, argv + 2);   // G15: verbo cru ao codec
+    if (!strcmp(argv[1], "codec-p2")) return cmd_codec_p2();
+    if (!strcmp(argv[1], "reg-read")) return cmd_reg_read(argc - 2, argv + 2);                   // G15: registradores (diagnostico)                          // G15: diagnostico do P2                 // M6 driver mode
     if (!strcmp(argv[1], "rec")) return cmd_rec(argc - 2, argv + 2);                 // M7 microphones
     if (!strcmp(argv[1], "tplg")) {   // offline: topology dump + the generated IPC3 plan (no kext needed)
         static struct tplg tp; static struct m5plan pl;

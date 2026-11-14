@@ -16,7 +16,7 @@ echo "SDK: $SDK"
 cd ~/g15fan
 K=G15Fan.kext; rm -rf $K; mkdir -p $K/Contents/MacOS; cp Info.plist $K/Contents/
 FLAGS=(-arch x86_64 -mkernel -nostdinc -fno-builtin -fno-common -fno-stack-protector -mmacosx-version-min=13.0
-       -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -isystem $SDK/Headers -O2 -Wall)
+       -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -isystem $SDK/Headers -I$R/kexts/common -O2 -Wall)
 cat > info.c <<'EOC'
 #include <mach/mach_types.h>
 static kern_return_t g15_start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }

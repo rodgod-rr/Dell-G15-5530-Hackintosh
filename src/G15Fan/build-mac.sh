@@ -7,7 +7,7 @@ SDK=${SDK:-$HOME/xps/build/deps/MacKernelSDK}; [ -d "$SDK" ] || { echo "sem MacK
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; cd "$W"
 K=G15Fan.kext; mkdir -p $K/Contents/MacOS; cp "$S/Info.plist" $K/Contents/
 FLAGS=(-arch x86_64 -mkernel -nostdinc -fno-builtin -fno-common -fno-stack-protector -mmacosx-version-min=13.0
-       -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -isystem $SDK/Headers -O2 -Wall)
+       -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -isystem $SDK/Headers -I$R/kexts/common -O2 -Wall)
 cat > info.c <<'EOC'
 #include <mach/mach_types.h>
 static kern_return_t g15_start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
@@ -24,4 +24,9 @@ clang++ -arch x86_64 -mkernel -nostdlib -static -Xlinker -kext -Xlinker -export_
 codesign -f -s - $K >/dev/null 2>&1 || true
 U=$(kmutil libraries -p $K --undef-symbols 2>&1 | grep -iE "not found|unresolved" || true)
 [ -z "$U" ] || { echo "simbolos sem dono:"; echo "$U"; exit 1; }
+# cada biblioteca usada tem de estar no OSBundleLibraries (sem isso o kext nao liga no boot e nao carrega; 10/11)
+D=$(plutil -extract OSBundleLibraries json -o - $K/Contents/Info.plist)
+for L in $(kmutil libraries -p $K --undef-symbols 2>&1 | sed -nE 's/.*\.kc: ([^ ]+) \(.*/\1/p' | sort -u); do
+  case "$D" in *"\"$L\""*) ;; *) echo "falta $L no OSBundleLibraries do Info.plist"; exit 1;; esac
+done
 mkdir -p "$OUT"; rm -rf "$OUT/$K"; cp -R $K "$OUT/"; md5 -q "$OUT/$K/Contents/MacOS/G15Fan"

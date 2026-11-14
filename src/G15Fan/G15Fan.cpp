@@ -40,14 +40,18 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
+#include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
+#define G15FL_IMPL
+#include "g15_filelog.hpp"
 
-#define LOG(fmt, ...) IOLog("G15Fan: " fmt "\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) g15fl::logf("G15Fan: " fmt, ##__VA_ARGS__)
 
 class G15Fan : public IOService {
     OSDeclareDefaultStructors(G15Fan)
@@ -76,6 +80,12 @@ class G15Fan : public IOService {
     uint32_t rp[6] {};                                // pedidos ->0, pedidos ->1, PEG1 ->0 fora do sono, GOFF, servicos achados, ultimo modo
     int rtxPm(uint32_t mode);
     void publishRtxPm();
+    void publishPcieLinks();
+    bool pegLdis {false};                             // Link Disable posto no PEG1 (teste #87, so manual)
+    IOReturn pegLinkDisable(bool on);
+    IOReturn dmiDump();
+    IOReturn pmcDump();
+    IOReturn pmcLtrIgnore(uint32_t mask);
 
     static IOReturn sleepWake(void *target, void *ref, UInt32 msg, IOService *prov, void *arg, vm_size_t argSize);
     static bool pciPublished(void *target, void *ref, IOService *dev, IONotifier *n);
@@ -242,6 +252,7 @@ void G15Fan::publishHooks() {                     // "SleepHooks" no ioreg (o IO
 
 void G15Fan::callRtx(const char *m, int counter) {   // GOFF/GONN do SSDT-RTXKEXT
     UInt32 r = 0, sd = 0;
+    if (pegLdis && m[1] == 'O' && m[2] == 'N') pegLinkDisable(false);   // GONN: link de volta antes da energia
     IOLockLock(lock);
     IOReturn e = acpi->evaluateInteger(m, &r);
     acpi->evaluateInteger("GSLP", &sd);
@@ -418,12 +429,13 @@ static void g15Rtd3Probe(IOService *self, IOACPIPlatformDevice *own) {
     if (pc00) n += snprintf(b + n, sizeof b - n, "pc00_val_off=0x%x peg1_val_off=0x%x",
         pc00->validateObject("\\_SB.PC00.PEG1.PG01._OFF"), peg1 ? peg1->validateObject("PG01._OFF") : 0xdead);
     self->setProperty("RTD3Probe", b);
-    IOLog("G15Fan: RTD3Probe %s\n", b);
+    g15fl::logf("G15Fan: RTD3Probe %s", b);
     OSSafeReleaseNULL(pc00); OSSafeReleaseNULL(peg1);
 }
 
 bool G15Fan::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
+    g15fl::init("g15fan");
     acpi = OSDynamicCast(IOACPIPlatformDevice, provider);
     lock = IOLockAlloc();
     if (!acpi || !lock) return false;
@@ -563,6 +575,155 @@ IOReturn G15Fan::callPlatformFunction(const OSSymbol *name, bool wait, void *p1,
     return kIOReturnSuccess;
 }
 
+// (#87, 10/11) "PcieLinks": so LEITURA do config space de cada IOPCIDevice com capacidade PCIe, para achar o link fora
+// de L1 que prende o pacote em PC2 (PKGC_BREAK_CAUSE_NOT_L1). Pedido: {"PcieLinks": qualquer} (tools/macos-pcielinks.py).
+// Por dispositivo (chave = pcidebug): ASPM suportado/ligado (LNKCAP 11:10, LNKCTL 1:0), clkpm, link desligado (LNKCTL 4),
+// LNKSTA (velocidade, largura, DLL ativo), LTR ligado (DEVCTL2 10), estado D (PMCSR), L1SS CTL1 e LTR max (snoop/no).
+// Nao le os filhos do PEG1 com a RTX parada (placa sem energia).
+void G15Fan::publishPcieLinks() {
+    OSDictionary *out = OSDictionary::withCapacity(16);
+    OSDictionary *m = serviceMatching("IOPCIDevice");
+    OSIterator *it = m ? getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    while (OSObject *o = (it && out) ? it->getNextObject() : nullptr) {
+        auto dev = OSDynamicCast(IOPCIDevice, o);
+        if (!dev) continue;
+        if (peg1 && rtxIdle && dev->getParentEntry(gIOServicePlane) == peg1) continue;
+        auto dbg = OSDynamicCast(OSString, dev->getProperty("pcidebug"));
+        UInt8 pe = 0;
+        if (!dev->findPCICapability(kIOPCIPCIExpressCapability, &pe) || !pe) continue;
+        UInt32 lcap = dev->configRead32(pe + 0x0C);
+        UInt16 lctl = dev->configRead16(pe + 0x10), lsta = dev->configRead16(pe + 0x12);
+        UInt16 dctl2 = dev->configRead16(pe + 0x28);
+        UInt8 pm = 0; UInt16 pmcsr = 0xFFFF;
+        if (dev->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) pmcsr = dev->configRead16(pm + 4);
+        IOByteCount l1 = 0, lt = 0; UInt32 l1c = 0xFFFFFFFF, ltr = 0xFFFFFFFF;
+        if (dev->extendedFindPCICapability(kIOPCIExpressL1PMSubstatesCapability, &l1) && l1) l1c = dev->configRead32(l1 + 8);
+        if (dev->extendedFindPCICapability(kIOPCIExpressLatencyTolerenceReportingCapability, &lt) && lt) ltr = dev->configRead32(lt + 4);
+        char b[200];
+        snprintf(b, sizeof b, "%s aspm sup %u lig %u clkpm %u desl %u | sta 0x%04x g%u x%u dll %u | ltr %u | D%u | l1ss 0x%08x | ltrmax 0x%08x",
+                 dev->getName(), (unsigned)((lcap >> 10) & 3), lctl & 3u, (lctl >> 8) & 1u, (lctl >> 4) & 1u,
+                 lsta, lsta & 0xFu, (lsta >> 4) & 0x3Fu, (lsta >> 13) & 1u, (dctl2 >> 10) & 1u, pmcsr & 3u, l1c, ltr);
+        OSString *v = OSString::withCString(b);
+        if (v) { out->setObject(dbg ? dbg->getCStringNoCopy() : dev->getName(), v); v->release(); }
+    }
+    OSSafeReleaseNULL(it);
+    if (out) { setProperty("PcieLinks", out); out->release(); }
+}
+
+// (#87, 10/11) Teste MANUAL, nada no boot: com a RTX parada e cortada (GOFF), o PEG1 fica em D0 com o link ativo e o
+// pacote nao passa de PC2 (NOT_L1). {"PegLinkDisable": 1} poe o Link Disable (LNKCTL bit 4) do PEG1; so aceita com a
+// RTX parada e o GOFF feito (GSLP bit 16). {"PegLinkDisable": 0} tira; o GONN (callRtx) tambem tira antes de religar.
+// (O D3hot do PEG1 com o corte travou o G15 em 10/11 de manha; o Link Disable deixa a porta em D0.)
+// Registro "PegLdis": estado, LNKCTL e LNKSTA depois. Se travar, reiniciar desfaz (nada fica gravado).
+IOReturn G15Fan::pegLinkDisable(bool on) {
+    auto dev = OSDynamicCast(IOPCIDevice, peg1);
+    if (!dev) return kIOReturnNotFound;
+    UInt32 sd = 0;
+    acpi->evaluateInteger("GSLP", &sd);
+    if (on && (!rtxIdle || !(sd & 0x10000))) return kIOReturnNotReady;   // so com a RTX parada e sem energia
+    UInt8 pe = 0;
+    if (!dev->findPCICapability(kIOPCIPCIExpressCapability, &pe) || !pe) return kIOReturnUnsupported;
+    UInt16 c = dev->configRead16(pe + 0x10);
+    dev->configWrite16(pe + 0x10, on ? (UInt16)(c | 0x10) : (UInt16)(c & ~0x10));
+    pegLdis = on;
+    IOSleep(on ? 20 : 100);
+    UInt16 c2 = dev->configRead16(pe + 0x10), st = dev->configRead16(pe + 0x12);
+    char b[120];
+    snprintf(b, sizeof b, "%s; LNKCTL 0x%04x -> 0x%04x; LNKSTA 0x%04x (dll %u); GSLP 0x%08x",
+             on ? "link desligado" : "link liberado", c, c2, st, (st >> 13) & 1u, sd);
+    setProperty("PegLdis", b);
+    LOG("PegLdis: %s", b);
+    return kIOReturnSuccess;
+}
+
+// (#87, 10/11) "DmiDump": so LEITURA. DMIBAR (registro 0x68 do host bridge 0:0:0, bit 0 = ligado, base nos bits 38:12)
+// mapeado sem cache e copiado (4 KB, leituras de 32 bits) para "DmiRegs" (OSData); "DmiBar" = valor cru do 0x68.
+// O tools/macos-pcielinks.c (dmi) procura a estrutura de link PCIe (LCAP/LCTL/LSTS) para ver o ASPM do DMI CPU<->PCH.
+IOReturn G15Fan::dmiDump() {
+    OSDictionary *m = serviceMatching("IOPCIDevice");
+    OSIterator *it = m ? getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    IOPCIDevice *mc = nullptr;
+    while (OSObject *o = it ? it->getNextObject() : nullptr) {
+        auto dev = OSDynamicCast(IOPCIDevice, o);
+        auto dbg = dev ? OSDynamicCast(OSString, dev->getProperty("pcidebug")) : nullptr;
+        if (dbg && dbg->isEqualTo("0:0:0")) { mc = dev; mc->retain(); break; }
+    }
+    OSSafeReleaseNULL(it);
+    if (!mc) return kIOReturnNotFound;
+    uint64_t raw = mc->configRead32((UInt8)0x68) | ((uint64_t)mc->configRead32((UInt8)0x6C) << 32);
+    mc->release();
+    setProperty("DmiBar", raw, 64);
+    if (!(raw & 1)) return kIOReturnNotReady;
+    IOPhysicalAddress base = (IOPhysicalAddress)(raw & 0x7FFFFFF000ULL);
+    // so a janela FED00000-FEDFFFFF, onde a BIOS deste G15 poe os BARs do host (PDRC._CRS: GMHB/GDMB/GEPB);
+    // fora disso pode nao ser o DMI deste chip, e nao le nada
+    if (base < 0xFED00000ULL || base > 0xFEDFF000ULL) return kIOReturnNotPermitted;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(base, 0x1000, kIODirectionIn);
+    IOMemoryMap *map = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+    IOReturn ret = kIOReturnNoMemory;
+    if (map) {
+        uint32_t buf[0x400];
+        volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+        for (int i = 0; i < 0x400; i++) buf[i] = r[i];
+        OSData *dt = OSData::withBytes(buf, sizeof buf);
+        if (dt) { setProperty("DmiRegs", dt); dt->release(); ret = kIOReturnSuccess; }
+        map->release();
+    }
+    OSSafeReleaseNULL(md);
+    LOG("DmiDump: DMIBAR 0x%llx -> 0x%x", raw, ret);
+    return ret;
+}
+
+// (#87, 10/11) "PmcDump": so LEITURA do PMC do PCH, os mesmos registradores que o intel_pmc_core do Linux le no
+// RPL-HX (adl_reg_map: INTEL_RAPTORLAKE/_S -> adl_pmc_dev). Base 0xFE000000 = contador SLP_S0 da LPIT deste G15
+// (0xFE001098) - ADL_PMC_SLP_S0_RES_COUNTER_OFFSET 0x1098. Le so os offsets da lista (LTR por IP 0x1B50-0x1C08,
+// LTR_IGNORE 0x1B0C, PM_CFG 0x1818, SLP_S0 0x1098, PPFEAR 0x1D90-0x1D97). "PmcRegs" = OSData de pares {offset, valor}.
+IOReturn G15Fan::pmcDump() {
+    static const uint16_t offs[] = {0x1098, 0x1818, 0x1B0C, 0x1B50, 0x1B54, 0x1B60, 0x1B64, 0x1B68, 0x1B6C, 0x1B70,
+        0x1B74, 0x1B78, 0x1B7C, 0x1B80, 0x1B84, 0x1B8C, 0x1B90, 0x1B94, 0x1B98, 0x1B9C, 0x1BA0, 0x1BA4, 0x1BF0,
+        0x1BF4, 0x1BF8, 0x1BFC, 0x1C00, 0x1C04, 0x1C08, 0x1D90, 0x1D94};
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(0xFE000000, 0x2000, kIODirectionIn);
+    IOMemoryMap *map = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+    IOReturn ret = kIOReturnNoMemory;
+    if (map) {
+        uint32_t buf[2 * (sizeof offs / sizeof offs[0])];
+        volatile uint8_t *b = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+        for (unsigned i = 0; i < sizeof offs / sizeof offs[0]; i++) {
+            buf[2 * i] = offs[i];
+            buf[2 * i + 1] = *reinterpret_cast<volatile uint32_t *>(b + offs[i]);
+        }
+        OSData *dt = OSData::withBytes(buf, sizeof buf);
+        if (dt) { setProperty("PmcRegs", dt); dt->release(); ret = kIOReturnSuccess; }
+        map->release();
+    }
+    OSSafeReleaseNULL(md);
+    return ret;
+}
+
+// (#87, 10/11) Teste MANUAL: grava o LTR_IGNORE do PMC (0xFE000000 + 0x1B0C), o mesmo que o debugfs ltr_ignore do
+// Linux (pmc_core_send_ltr_ignore: bit = indice da IP na lista ltr_show do adl; XHCI 4, SOUTHPORT_G 23; max 23).
+// {"PmcLtrIgnore": mascara}; 0 volta ao original (0 no boot). Nao fica gravado: o reinicio zera. Depois relê (PmcRegs).
+IOReturn G15Fan::pmcLtrIgnore(uint32_t mask) {
+    if (mask & ~0x00FFFFFFu) return kIOReturnBadArgument;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(0xFE000000, 0x2000, kIODirectionInOut);
+    IOMemoryMap *map = md ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    IOReturn ret = kIOReturnNoMemory;
+    if (map) {
+        volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress() + 0x1B0C);
+        uint32_t before = *r;
+        *r = mask;
+        uint32_t after = *r;
+        LOG("LTR_IGNORE 0x%08x -> 0x%08x (pedido 0x%08x)", before, after, mask);
+        map->release();
+        ret = kIOReturnSuccess;
+    }
+    OSSafeReleaseNULL(md);
+    if (ret == kIOReturnSuccess) pmcDump();
+    return ret;
+}
+
 IOReturn G15Fan::setProperties(OSObject *props) {
     auto d = OSDynamicCast(OSDictionary, props);
     if (!d) return kIOReturnBadArgument;
@@ -571,11 +732,40 @@ IOReturn G15Fan::setProperties(OSObject *props) {
     if (write && IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
         IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
         return kIOReturnNotPrivileged;
+    if (d->getObject("PcieLinks")) { publishPcieLinks(); return kIOReturnSuccess; }   // so leitura (#87)
+    if (d->getObject("DmiDump")) return dmiDump();                                   // so leitura (#87)
+    if (d->getObject("PmcDump")) return pmcDump();                                   // so leitura (#87)
+    if (auto n = OSDynamicCast(OSNumber, d->getObject("PmcLtrIgnore"))) {   // teste #87: root ou usuario da sessao
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+            IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return pmcLtrIgnore(n->unsigned32BitValue());
+    }
+    if (auto n = OSDynamicCast(OSNumber, d->getObject("PegLinkDisable"))) {   // teste #87: root ou usuario da sessao
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+            IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        return pegLinkDisable(n->unsigned32BitValue() != 0);
+    }
     if (auto n = OSDynamicCast(OSNumber, d->getObject("RtxPm"))) {   // root ou o usuario da sessao grafica (G15.app)
         if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
             IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
             return kIOReturnNotPrivileged;
         return rtxPm(n->unsigned32BitValue());
+    }
+    // #87 (14/11): {"BtReset": 0} prende o Bluetooth em reset (\_SB.BTRK(Zero) pelo SSDT-BTRK: o BT sai do USB);
+    // 1 solta (volta a enumerar). Publica "BtReset" = GBTR (1 solto, 0 em reset). So com o SSDT-BTRK carregado.
+    if (auto n = OSDynamicCast(OSNumber, d->getObject("BtReset"))) {
+        if (IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeLocalUser) != kIOReturnSuccess &&
+            IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        if (!acpi) return kIOReturnNotReady;
+        IOReturn r = acpi->evaluateObject(n->unsigned32BitValue() ? "BTON" : "BTOF");
+        UInt32 st = 0xFF;
+        acpi->evaluateInteger("BTST", &st);
+        setProperty("BtReset", st, 32);
+        LOG("BtReset %u -> 0x%x (GBTR %u)", n->unsigned32BitValue(), r, st);
+        return r;
     }
     IOReturn ret = kIOReturnSuccess;
     IOLockLock(lock);

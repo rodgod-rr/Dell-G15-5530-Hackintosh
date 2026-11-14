@@ -765,7 +765,6 @@ static void bgSet(pid_t pid, NSString *name) {     // pid 0 = desliga (e descong
 // ---------- extras do perfil Bateria (11/11) ----------
 // Entrar na Bateria: tela interna a 60 Hz (de 120), brilho no maximo 50% e RTX no modo "Desligada". Sair da Bateria:
 // volta a taxa de antes (pref "hzAntesBateria") e a RTX vai para "Automatica" (se estava Desligada); o brilho fica.
-// O Bluetooth usa 1 min (em vez de 3) enquanto o perfil for Bateria (btTick).
 static int onAC(void);
 static void rtxSetMode(int m);
 static CGDirectDisplayID builtinDisplay(void) {
@@ -1469,78 +1468,8 @@ static void kbWindowOpen(void) {
 }
 static void kbWindowRefresh(void) { if (kbWin) [kbWin sync]; }
 
-// ---------- Bluetooth automatico (#87, 10/11) ----------
-// Com o BT ligado o pacote nao passa de PC2 (NOT_L1 do CNVi) e o G15 gasta ~7-10 W a mais parado. Se o BT ficar ligado
-// sem nenhum aparelho conectado por 3 min (1 min no perfil Bateria, 11/11), o app desliga o BT (preferencia "btAuto",
-// padrao ligada; seletor no painel).
-// Estado e aparelhos: system_profiler SPBluetoothDataType -json (sem permissao, ~0,2 s, fora da thread principal, a
-// cada 15 s). Ligar/desligar: IOBluetoothPreferenceSetControllerPowerState (IOBluetooth, por dlsym; o macOS pede a
-// permissao de Bluetooth ao G15 na 1a vez: NSBluetoothAlwaysUsageDescription no Info.plist).
-static int btLimit(void);                         // 60 s no perfil Bateria, senao 180 s
-static int btOn = -1, btConnected = -1;             // -1 = ainda nao lido
-static NSArray<NSString *> *btNames;               // aparelhos conectados
-static int btIdleSecs;
-static BOOL btBusy;
-static dispatch_queue_t btq;
-static BOOL btAuto(void) { id v = [prefs objectForKey:@"btAuto"]; return v ? [v boolValue] : YES; }
-static void btRead(void (^done)(void)) {           // assincrono; done roda na thread principal
-    if (btBusy) {                                  // leitura em curso: tenta de novo em 1 s (nao perde o "done")
-        if (done) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ btRead(done); });
-        return;
-    }
-    btBusy = YES;
-    if (!btq) btq = dispatch_queue_create("g15.bt", DISPATCH_QUEUE_SERIAL);
-    dispatch_async(btq, ^{
-        NSTask *t = [NSTask new]; NSPipe *p = [NSPipe pipe];
-        t.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/system_profiler"];
-        t.arguments = @[@"SPBluetoothDataType", @"-json"]; t.standardOutput = p; t.standardError = NSFileHandle.fileHandleWithNullDevice;
-        int on = -1, n = -1; NSMutableArray *names = [NSMutableArray array];
-        if ([t launchAndReturnError:nil]) {
-            NSData *d = [p.fileHandleForReading readDataToEndOfFile]; [t waitUntilExit];
-            NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
-            NSDictionary *bt = [j[@"SPBluetoothDataType"] firstObject];
-            NSString *s = bt[@"controller_properties"][@"controller_state"];
-            if (s) on = [s isEqualToString:@"attrib_on"];
-            NSArray *c = bt[@"device_connected"];
-            n = (int)c.count;
-            for (NSDictionary *e in c) [names addObjectsFromArray:e.allKeys];
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{ btOn = on; btConnected = n; btNames = names; btBusy = NO; if (done) done(); });
-    });
-}
-static void btSetPower(BOOL on, const char *why) {  // fora da thread principal: a 1a chamada pode esperar a permissao
-    if (!btq) btq = dispatch_queue_create("g15.bt", DISPATCH_QUEUE_SERIAL);
-    dispatch_async(btq, ^{
-        void (*set)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "IOBluetoothPreferenceSetControllerPowerState");
-        if (!set) { void *h = dlopen("/System/Library/Frameworks/IOBluetooth.framework/IOBluetooth", RTLD_LAZY);
-                    set = h ? (void (*)(int))dlsym(h, "IOBluetoothPreferenceSetControllerPowerState") : NULL; }
-        if (set) set(on ? 1 : 0);
-        NSLog(@"Bluetooth %s (%s): %s", on ? "ligar" : "desligar", why, set ? "pedido" : "sem a funcao do IOBluetooth");
-        sleep(2);                                  // confere: o bluetoothd ignora o pedido sem a permissao de Bluetooth
-        dispatch_async(dispatch_get_main_queue(), ^{ btIdleSecs = 0; btRead(^{
-            if (g15Quitting) return;
-            if (btOn == (on ? 1 : 0)) {
-                NSLog(@"Bluetooth %s", on ? "ligado" : "desligado");
-                if (!on && strcmp(why, "painel"))
-                    notify(@"Bluetooth", btLimit() <= 60 ? L("Desligado: 1 minuto sem aparelhos conectados (perfil Bateria).", "Turned off: no devices connected for 1 minute (Battery profile).")
-                                                         : L("Desligado: 3 minutos sem aparelhos conectados.", "Turned off: no devices connected for 3 minutes."));
-            } else {
-                NSLog(@"Bluetooth continua %s: pedido ignorado (permissao de Bluetooth do G15?)", btOn == 1 ? "ligado" : "desligado");
-                notify(@"Bluetooth", L("Não consegui mudar o Bluetooth: o G15 precisa da permissão de Bluetooth.",
-                                       "Could not change Bluetooth: G15 needs the Bluetooth permission."));
-            }
-        }); });
-    });
-}
+// Bluetooth: o painel e o desligamento automatico sairam em 14/11 (G15PM BtIdle: BT ligado ocioso ja nao prende o pacote).
 static int curProfile = -1;                        // ultimo perfil lido pelo tick
-static int btLimit(void) { return curProfile >= 0 && profileRank(curProfile) == 0 ? 60 : 180; }
-static void btTick(int secs) {                     // chamado a cada 15 s pelo tick
-    btRead(^{
-        if (btOn != 1 || btConnected != 0 || !btAuto()) { btIdleSecs = 0; return; }
-        btIdleSecs += secs;
-        if (btIdleSecs >= btLimit()) btSetPower(NO, btLimit() <= 60 ? "1 min sem aparelhos (Bateria)" : "3 min sem aparelhos");
-    });
-}
 
 @class G15Panel;
 static G15Panel *panel;
@@ -1603,7 +1532,6 @@ static void panelToggle(NSStatusBarButton *b);
         if (kb != kbBattery) { kbBattery = kb; if (kbLevel == 1) kbSend(kbPct(1)); kbWindowRefresh(); }
     }
     rtxTick(st, onAC());
-    static int n; if (n++ % 3 == 0) btTick(15);       // Bluetooth a cada 15 s
     [self updateTitle:st];
     if (!st) return;
     int t = MAX(fanTemp(st, @"0x01"), fanTemp(st, @"0x06")), b = fanBoost(st);
@@ -1821,11 +1749,10 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 @end
 
 @implementation G15Panel {
-    NSTextField *_cpuT, *_rtxT, *_rpmT, *_hzT, *_btAutoL, *_rtxCap, *_profV, *_fanV, *_rtxV, *_btV, *_kbV, *_micV, *_sub;
+    NSTextField *_cpuT, *_rtxT, *_rpmT, *_hzT, *_rtxCap, *_profV, *_fanV, *_rtxV, *_kbV, *_micV, *_sub;
     NSView *_rtxDot;
     NSSegmentedControl *_profSeg, *_fanSeg, *_rtxSeg, *_kbSeg;
     NSArray<NSNumber *> *_profIds;
-    NSSwitch *_btPower, *_btAutoSw;
     NSSlider *_mic;
     NSButton *_perm;
     NSBox *_rtxCard;
@@ -1898,16 +1825,6 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     NSStackView *ah = hstack(@[_appIcon, lbl(L("App na RTX", "App on RTX"), 13, NSFontWeightSemibold, nil), spacer(), _appV], 7);
     _appCard = card(vstack(@[ah, hstack(@[_appInfo, spacer(), _bgBtn], 8)], 8));
 
-    // Bluetooth
-    _btV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    _btPower = [NSSwitch new]; _btPower.target = self; _btPower.action = @selector(btPower:); _btPower.controlSize = NSControlSizeSmall;
-    _btAutoSw = [NSSwitch new]; _btAutoSw.target = self; _btAutoSw.action = @selector(btAuto:); _btAutoSw.controlSize = NSControlSizeSmall;
-    NSTextField *autoL = _btAutoL = lbl(L("Desligar sem aparelhos (3 min)", "Turn off with no devices (3 min)"), 12, NSFontWeightRegular, nil);
-    // (o SF Symbol "bluetooth" nao existe; ondas de radio no lugar)
-    NSStackView *bh = hstack(@[sym(@"dot.radiowaves.left.and.right", 13, NSColor.controlAccentColor),
-                               vstack(@[lbl(@"Bluetooth", 13, NSFontWeightSemibold, nil), _btV], 1), spacer(), _btPower], 7);
-    NSBox *btCard = card(vstack(@[bh, hstack(@[autoL, spacer(), _btAutoSw], 6)], 8));
-
     // luz do teclado
     _kbV = lbl(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
     _kbSeg = [NSSegmentedControl segmentedControlWithLabels:@[L("Apagada", "Off"), @"50%", @"100%"]
@@ -1935,7 +1852,7 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
                                                b.font = [NSFont systemFontOfSize:12]; }
     NSStackView *foot = hstack(@[_perm, spacer(), log, quit], 14);
 
-    NSStackView *root = vstack(@[top, tiles, profCard, fanCard, _rtxCard, _appCard, btCard, kbCard, micCard, foot], 8);
+    NSStackView *root = vstack(@[top, tiles, profCard, fanCard, _rtxCard, _appCard, kbCard, micCard, foot], 8);
     root.edgeInsets = NSEdgeInsetsMake(14, 14, 10, 14);
     root.alignment = NSLayoutAttributeLeading;
     for (NSView *v in root.arrangedSubviews)
@@ -1963,7 +1880,6 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     _rpmT.toolTip = [rr componentsJoinedByString:@" / "];
     double hz = currentRefresh();                  // taxa atual da tela interna
     _hzT.stringValue = hz > 0 ? [NSString stringWithFormat:@"%.0f", hz] : @"--";
-    _btAutoL.stringValue = [NSString stringWithFormat:L("Desligar sem aparelhos (%d min)", "Turn off with no devices (%d min)"), btLimit() / 60];
     NSColor *rc = r.state == 2 ? NSColor.systemGreenColor : r.state == 1 ? NSColor.systemYellowColor : NSColor.systemRedColor;
     _rtxDot.layer.backgroundColor = rc.CGColor;
     _rtxCap.stringValue = @"RTX";
@@ -2009,14 +1925,6 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     }
     _rtxV.stringValue = [NSString stringWithFormat:@"%@%@", rtxStateName(r.state), r.state == 2 ? [NSString stringWithFormat:@" · %d%%", r.util] : @""];
 
-    _btPower.state = btOn == 1 ? NSControlStateValueOn : NSControlStateValueOff;
-    _btPower.enabled = btOn >= 0;
-    _btAutoSw.state = btAuto() ? NSControlStateValueOn : NSControlStateValueOff;
-    NSString *bs = btOn < 0 ? @"…" : btOn == 0 ? L("desligado", "off")
-                 : btConnected > 0 ? [btNames componentsJoinedByString:@", "]
-                 : btAuto() ? [NSString stringWithFormat:L("sem aparelhos · desliga em %d s", "no devices · off in %d s"), MAX(0, btLimit() - btIdleSecs)]
-                            : L("sem aparelhos", "no devices");
-    _btV.stringValue = bs;
 
     _kbSeg.selectedSegment = kbLevel;
     [_kbSeg setLabel:[NSString stringWithFormat:@"%d%%", kbPct(1)] forSegment:1];
@@ -2036,7 +1944,6 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
 }
 - (void)popoverWillShow:(NSNotification *)n {
     [self refresh];
-    btRead(^{ [self refresh]; });
     _timer = [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *t) { [self refresh]; }];
     [[NSRunLoop currentRunLoop] addTimer:_timer forMode:NSRunLoopCommonModes];
 }
@@ -2049,9 +1956,6 @@ static NSStackView *head(NSString *symbol, NSString *title, NSTextField *value) 
     else if (_bgShownPid) bgSet(_bgShownPid, _bgShownName);
     [self refresh];
 }
-- (void)btPower:(NSSwitch *)s { btSetPower(s.state == NSControlStateValueOn, "painel"); _btV.stringValue = @"…"; }
-- (void)btAuto:(NSSwitch *)s { [prefs setBool:s.state == NSControlStateValueOn forKey:@"btAuto"]; btIdleSecs = 0;
-                               NSLog(@"Bluetooth automatico: %s", s.state == NSControlStateValueOn ? "ligado" : "desligado"); [self refresh]; }
 - (void)kb:(NSSegmentedControl *)s { kbSet(s.selectedSegment, NO); [self refresh]; }
 - (void)colors:(id)s { [_pop performClose:nil]; kbWindowOpen(); }
 - (void)mic:(NSSlider *)sl {
@@ -2171,7 +2075,6 @@ int main(int argc, const char *argv[]) {
             prefs = [[NSUserDefaults alloc] initWithSuiteName:@"local.g15"];
             [NSApplication sharedApplication];
             NSApp.appearance = [NSAppearance appearanceNamed:!strcmp(argv[3], "escuro") ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
-            btOn = 1; btConnected = 0; btIdleSecs = 45;
             if (getenv("G15_PAINEL_APP")) {          // previa do cartao "App na RTX" (G15_PAINEL_APP=nome [G15_PAINEL_PAUSADO=1])
                 bgPid = getpid(); bgName = @(getenv("G15_PAINEL_APP")); bgPaused = getenv("G15_PAINEL_PAUSADO") != NULL;
             }

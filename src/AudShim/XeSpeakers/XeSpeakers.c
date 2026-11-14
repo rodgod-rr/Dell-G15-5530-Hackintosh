@@ -44,14 +44,26 @@
 #include "xs_ns.h"
 #include "df_ns.h"
 
-#define XS_VERSION "0.9.0"
+#define XS_VERSION "0.9.3"
 #define kDeviceUID "XeSpeakers_InternalSpeakers_UID"
 #define kModelUID "XeSpeakers_RT1316x2_Model"
 #define kDeviceName "Alto-falantes internos"
+#define kHpName "Fones de ouvido"
+// seletores de AudioHardware.h (o AudioServerPlugIn.h so traz o AudioHardwareBase.h)
+#ifndef kAudioDevicePropertyDataSource
+#define kAudioDevicePropertyDataSource 0x73737263u                    /* 'ssrc' */
+#define kAudioDevicePropertyDataSources 0x73736323u                   /* 'ssc#' */
+#define kAudioDevicePropertyDataSourceNameForIDCFString 0x6C73636Eu   /* 'lscn' */
+#endif
+#define kSrcSpk 0x6973706Bu   /* 'ispk' */
+#define kSrcHp 0x6864706Eu    /* 'hdpn' */
 #define kManufacturer "Xe (AudShim/SOF)"
 #define kMicUID "XeSpeakers_InternalMic_UID"
 #define kMicModelUID "XeSpeakers_RT714_Model"
 #define kMicName "Microfone interno"
+#define kHsMicName "Microfone do fone"
+#define kSrcImic 0x696D6963u   /* 'imic' */
+#define kSrcHmic 0x686D6963u   /* 'hmic' */
 
 enum {
     kObjPlugIn = kAudioObjectPlugInObject,   // 1
@@ -97,6 +109,8 @@ static mach_vm_address_t gCRingAddr = 0;
 static uint64_t gCRingGen = 0;               // kext capture ring generation the mapping belongs to
 static UInt32 gMicIOCount = 0;
 static Float32 gMicScalar = kMicDefaultScalar;
+static _Atomic bool gHsMic = false;          // G15 P2 (0.9.3): mic do fone em uso (HeadphonesPlugged e HeadsetMicActive do kext)
+static _Atomic bool gHp = false;             // G15 P2 (0.9.1): fone no 0x21 (propriedade HeadphonesPlugged do AudShim 0.9.3)
 static dfns gDf;                             // G15: DeepFilterNet3 (df_ns.c), preferido ao xs_ns quando a libdf esta no .driver
 static volatile bool gUseDf = false;
 static uint32_t gDfResets;
@@ -253,6 +267,47 @@ static void *openThread(void *arg) {
     return NULL;
 }
 
+// G15 P2: le a cada 300 ms a propriedade HeadphonesPlugged do kext (o kext le o pin sense so com o som ligado, entao isto
+// nao acorda o codec) e avisa o Core Audio: nome do dispositivo, fonte de dados ('ispk'/'hdpn') e tipo de terminal.
+static void *hpThread(void *arg) {
+    (void)arg;
+    io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("AudShim"));
+    if (!svc) return NULL;
+    for (;;) {
+        CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("HeadphonesPlugged"), NULL, 0);
+        bool hp = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+        if (v) CFRelease(v);
+        v = IORegistryEntryCreateCFProperty(svc, CFSTR("HeadsetMicActive"), NULL, 0);
+        bool hm = hp && v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);   // fone sem mic: DMIC
+        if (v) CFRelease(v);
+        if (hm != atomic_load(&gHsMic) && gHost && gMicPublished) {
+            atomic_store(&gHsMic, hm);
+            os_log(gLog, "XeSpeakers: entrada -> %{public}s", hm ? kHsMicName : kMicName);
+            AudioObjectPropertyAddress m[3] = {
+                {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                {kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain},
+                {kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+            };
+            AudioObjectPropertyAddress mt = {kAudioStreamPropertyTerminalType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            gHost->PropertiesChanged(gHost, kObjMicDevice, 3, m);
+            gHost->PropertiesChanged(gHost, kObjMicStream, 1, &mt);
+        }
+        if (hp != atomic_load(&gHp)) {
+            atomic_store(&gHp, hp);
+            os_log(gLog, "XeSpeakers: saida -> %{public}s", hp ? kHpName : kDeviceName);
+            AudioObjectPropertyAddress d[3] = {
+                {kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                {kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain},
+                {kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+            };
+            AudioObjectPropertyAddress st = {kAudioStreamPropertyTerminalType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+            if (gHost) { gHost->PropertiesChanged(gHost, kObjDevice, 3, d); gHost->PropertiesChanged(gHost, kObjStream, 1, &st); }
+        }
+        usleep(300000);
+    }
+    return NULL;
+}
+
 // ------------------------------------------------------------------ IUnknown / factory
 static HRESULT QueryInterface(void *drv, REFIID iid, LPVOID *out);
 static ULONG AddRef(void *drv);
@@ -343,6 +398,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef drv, AudioServerPlugInHost
     pthread_t t;
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&t, &at, openThread, NULL);
+    if (iface >= 10) pthread_create(&t, &at, hpThread, NULL);   // G15 P2: fone (AudShim 0.9.3)
     pthread_attr_destroy(&at);
     return kAudioHardwareNoError;
 }
@@ -413,6 +469,10 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_
             // every scope: the HAL queries these for input and output while adding a device; an "unknown property"
             // answer there aborts the add ("Caught exception trying to add device"). Input scope reports 0 / none.
             return true;
+        case kAudioDevicePropertyDataSource: case kAudioDevicePropertyDataSources:
+        case kAudioDevicePropertyDataSourceNameForIDCFString:   // G15 P2: so a saida, fonte 'ispk' ou 'hdpn'
+            if (obj == kObjMicDevice) return a->mScope != kAudioObjectPropertyScopeOutput;   // P2 etapa 2: 'imic' ou 'hmic'
+            return obj == kObjDevice && a->mScope != kAudioObjectPropertyScopeInput;
         }
         return false;
     case kObjStream:
@@ -501,7 +561,25 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: RET(AudioClassID, kAudioDeviceClassID);
         case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjPlugIn);
-        case kAudioObjectPropertyName: RETCF(kDeviceName);
+        case kAudioObjectPropertyName: if (atomic_load(&gHp)) RETCF(kHpName); RETCF(kDeviceName);
+        case kAudioDevicePropertyDataSource: RET(UInt32, atomic_load(&gHp) ? kSrcHp : kSrcSpk);
+        case kAudioDevicePropertyDataSources: {
+            UInt32 l[2] = {kSrcSpk, kSrcHp};
+            if (out) { if (inSize < sizeof l) return kAudioHardwareBadPropertySizeError; memcpy(out, l, sizeof l); }
+            *outSize = sizeof l; return 0;
+        }
+        case kAudioDevicePropertyDataSourceNameForIDCFString: {
+            if (out) {
+                if (inSize < sizeof(AudioValueTranslation)) return kAudioHardwareBadPropertySizeError;
+                AudioValueTranslation *t = (AudioValueTranslation *)out;
+                if (t->mInputDataSize < sizeof(UInt32) || !t->mInputData || t->mOutputDataSize < sizeof(CFStringRef) || !t->mOutputData)
+                    return kAudioHardwareBadPropertySizeError;
+                UInt32 id = *(const UInt32 *)t->mInputData;
+                if (id != kSrcSpk && id != kSrcHp) return kAudioHardwareIllegalOperationError;
+                *(CFStringRef *)t->mOutputData = id == kSrcHp ? CFSTR(kHpName) : CFSTR(kDeviceName);
+            }
+            *outSize = sizeof(AudioValueTranslation); return 0;
+        }
         case kAudioObjectPropertyManufacturer: RETCF(kManufacturer);
         case kAudioDevicePropertyDeviceUID: RETCF(kDeviceUID);
         case kAudioDevicePropertyModelUID: RETCF(kModelUID);
@@ -559,7 +637,25 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioObjectPropertyBaseClass: RET(AudioClassID, kAudioObjectClassID);
         case kAudioObjectPropertyClass: RET(AudioClassID, kAudioDeviceClassID);
         case kAudioObjectPropertyOwner: RET(AudioObjectID, kObjPlugIn);
-        case kAudioObjectPropertyName: RETCF(kMicName);
+        case kAudioObjectPropertyName: if (atomic_load(&gHsMic)) RETCF(kHsMicName); RETCF(kMicName);
+        case kAudioDevicePropertyDataSource: RET(UInt32, atomic_load(&gHsMic) ? kSrcHmic : kSrcImic);
+        case kAudioDevicePropertyDataSources: {
+            UInt32 l[2] = {kSrcImic, kSrcHmic};
+            if (out) { if (inSize < sizeof l) return kAudioHardwareBadPropertySizeError; memcpy(out, l, sizeof l); }
+            *outSize = sizeof l; return 0;
+        }
+        case kAudioDevicePropertyDataSourceNameForIDCFString: {
+            if (out) {
+                if (inSize < sizeof(AudioValueTranslation)) return kAudioHardwareBadPropertySizeError;
+                AudioValueTranslation *t = (AudioValueTranslation *)out;
+                if (t->mInputDataSize < sizeof(UInt32) || !t->mInputData || t->mOutputDataSize < sizeof(CFStringRef) || !t->mOutputData)
+                    return kAudioHardwareBadPropertySizeError;
+                UInt32 id = *(const UInt32 *)t->mInputData;
+                if (id != kSrcImic && id != kSrcHmic) return kAudioHardwareIllegalOperationError;
+                *(CFStringRef *)t->mOutputData = id == kSrcHmic ? CFSTR(kHsMicName) : CFSTR(kMicName);
+            }
+            *outSize = sizeof(AudioValueTranslation); return 0;
+        }
         case kAudioObjectPropertyManufacturer: RETCF(kManufacturer);
         case kAudioDevicePropertyDeviceUID: RETCF(kMicUID);
         case kAudioDevicePropertyModelUID: RETCF(kMicModelUID);
@@ -616,7 +712,7 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioObjectPropertyOwnedObjects: goto retlist;
         case kAudioStreamPropertyIsActive: RET(UInt32, 1);
         case kAudioStreamPropertyDirection: RET(UInt32, 1);   // input
-        case kAudioStreamPropertyTerminalType: RET(UInt32, kAudioStreamTerminalTypeMicrophone);
+        case kAudioStreamPropertyTerminalType: RET(UInt32, atomic_load(&gHsMic) ? kAudioStreamTerminalTypeHeadsetMicrophone : kAudioStreamTerminalTypeMicrophone);
         case kAudioStreamPropertyStartingChannel: RET(UInt32, 1);
         case kAudioStreamPropertyLatency: RET(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: RET(AudioStreamBasicDescription, streamFormat());
@@ -659,7 +755,7 @@ static OSStatus getProp(AudioObjectID obj, const AudioObjectPropertyAddress *a, 
         case kAudioObjectPropertyOwnedObjects: goto retlist;
         case kAudioStreamPropertyIsActive: RET(UInt32, 1);
         case kAudioStreamPropertyDirection: RET(UInt32, 0);   // output
-        case kAudioStreamPropertyTerminalType: RET(UInt32, kAudioStreamTerminalTypeSpeaker);
+        case kAudioStreamPropertyTerminalType: RET(UInt32, atomic_load(&gHp) ? kAudioStreamTerminalTypeHeadphones : kAudioStreamTerminalTypeSpeaker);
         case kAudioStreamPropertyStartingChannel: RET(UInt32, 1);
         case kAudioStreamPropertyLatency: RET(UInt32, 0);
         case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat: RET(AudioStreamBasicDescription, streamFormat());

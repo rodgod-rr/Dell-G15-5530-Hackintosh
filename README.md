@@ -28,9 +28,9 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - It needs the [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics) **0.4.4** package (the
     WhateverXe fork is based on 0.8.2 and publishes the activation token that Graphics 0.4.2+ requires). My patch layer
     on top of it is also in [rodgod-rr/WhateverXe-Graphics `g15`](https://github.com/rodgod-rr/WhateverXe-Graphics/tree/g15).
-- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 2.9. It runs
+- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 3.0. It runs
   alongside the UHD: Metal 3, about 4.9 TFLOPS.
-- **RTX powered off when idle (since 2026-11-10).** NullMoth 2.9's own RTD3 cannot cut power here (Apple's
+- **RTX powered off when idle (since 2026-11-10).** NullMoth's own RTD3 (2.9 and 3.0) cannot cut power here (Apple's
   `evaluateObject` only runs plain method names, and forcing it froze the system). Instead, the RTX goes through the
   same path as system sleep, while the system stays awake:
   - `G15Fan` asks IOPM to put NVRM and the HDMI audio function in power state 0. NullMoth then suspends the GPU with
@@ -80,9 +80,18 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   ([WhateverXe#87](https://github.com/b00t0x/WhateverXe/issues/87)).
 - **Audio:** internal speakers with volume and mute, and the internal microphone (DMIC) with DeepFilterNet3 noise
   suppression. This is `AudShim` + the `XeSpeakers` HAL plug-in.
+  - **Headphone jack (since 2026-11-14):** headphones switch automatically with the speakers ("Fones de ouvido"), and a
+    headset microphone works ("Microfone do fone"). The CTIA/OMTP type is detected like Linux does (headphone muted and
+    300 ms before reading the codec), so plugging in with audio playing no longer records the playback. Headphones
+    without a microphone are detected and keep the internal microphone.
 - **Connectivity:** Wi-Fi (AirportItlwm), Bluetooth, Ethernet (RTL8111) and USB.
-  - Bluetooth on keeps the package at PC2 while awake (about +5 W). G15.app turns Bluetooth off after 3 min with
-    no device connected (it asks for the Bluetooth permission once). In sleep it does not matter.
+  - **Bluetooth on no longer costs power (since 2026-11-14).** The Intel Bluetooth is a USB device owned by `bluetoothd`,
+    which never enables USB idle suspend (real Macs have UART/PCIe Bluetooth), so the port never suspended and the package
+    stayed at PC2 (about +5 W). `G15PM` (`BtIdle`) sets the IOUSBHost idle policy on the Bluetooth interfaces and its IN
+    pipes, and takes the idle `IntelBluetoothFirmware` driver out of the power tree (it blocked idle suspend). The port is
+    now suspended about half the time and idle power with Bluetooth on is the same as with it off (about 2.2 W). Headsets,
+    mice and sleep work. `sudo sysctl debug.g15btidle=0` turns it off (then toggle Bluetooth).
+- **iMessage and FaceTime** work (tested 2026-11-14).
 - **Input:** keyboard via VoodooPS2, touchpad via VoodooI2C in GPIO interrupt mode, keyboard backlight (AW-ELC), and the
   Fn keys F5 / F9 / F10 through G15.app.
 - **Keyboard lighting (G15.app → "Luz do teclado…"):** a window with a drawing of the keyboard and a live preview.
@@ -102,24 +111,31 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
 
 ## What partly works
 
-- **HDMI (wired to the RTX):** with NullMoth 2.9, a cable connected at boot works in extended and mirrored mode, and
-  resolution changes work. Hotplug is unreliable; a workaround is described in
-  [nullmoth#288](https://github.com/nullmoth/nvidia-macos-driver/issues/288).
+- **HDMI (wired to the RTX):** with NullMoth 3.0, a cable connected at boot works in extended and mirrored mode, and
+  resolution changes work; unplugging and replugging in that boot works too. A cable connected after a boot without one
+  needs a WindowServer restart: NullMoth only creates the RTX output when a display is present, and WindowServer fixes its
+  display pipes when it starts ([nullmoth#288](https://github.com/nullmoth/nvidia-macos-driver/issues/288), #581). The
+  workaround (arm the output with NullMoth's sysctls, then restart WindowServer) is described in #288.
 - **RTX idle power:** solved since 2026-11-10 by `G15Fan` + `G15PM` (see "What works"). NullMoth's own RTD3/GC6 still
   cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
-- **UHD hang (under observation since 2026-11-13).** The UHD sometimes stopped mid context switch (`gpuRestart`), the
-  screen went black and WindowServer was killed by its watchdog. The main suspect is the old two-byte Metal leak patch,
-  which freed the POSH buffer while the queue could still use it (it caused GPU restart storms for others in
-  [WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)); Graphics 0.4.4 fixes the leak safely and the old
-  patch is gone from this repository. The WhateverXe fork also keeps forcewake on every engine while it executes and
+- **UHD hang (rare, under observation).** The UHD sometimes stops mid context switch (`gpuRestart`), the screen goes
+  black and WindowServer is killed by its watchdog. It was frequent until 2026-11-13; the main suspect was the old
+  two-byte Metal leak patch, which freed the POSH buffer while the queue could still use it (GPU restart storms for others
+  in [WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)). Graphics 0.4.4 fixes the leak safely and the old
+  patch is gone from this repository. Since then I had one hang (2026-11-14, about 14 min after a boot). The WhateverXe fork also keeps forcewake on every engine while it executes and
   releases it as soon as the engine is idle (a still screen stays at about 1.2-1.7 W of package power). Each hang is
   written with per-engine registers to `/private/var/log/g15-uhd-hang-*.txt`; `wexg15unstick=31` tries to recover.
-- **eDP Panel Self Refresh (optional, experimental).** The boot-arg `wexg15psr=3` turns on PSR1 for the internal LG
-  panel: with a still screen the package drops from about 2.05 W to 1.17 W. It once froze WindowServer with a still
-  screen (possibly the same problem as the hang above), so it is off unless you add the boot-arg. The mode can be
-  changed at runtime with `sudo sysctl debug.g15psr=0` (off) or `=3`.
+- **eDP Panel Self Refresh (on in this config).** The boot-arg `wexg15psr=3` turns on PSR1 for the internal LG panel:
+  with a still screen the package drops from about 2.4 W to 1.5 W (PSR active 97% of the time). Since 2026-11-14 the
+  WhateverXe fork forces a PSR exit before each vblank wait: without it every wait timed out after 500 ms ("Wait for VBL
+  timed out" in the kernel log) and the first frame after a still screen could be late. The WindowServer freezes seen
+  with PSR in the first days were the hang above. Remove the boot-arg, or `sudo sysctl debug.g15psr=0`, to turn it off.
+- **Boot logo:** for a few frames, when the UHD takes over from the firmware (the moment the brightness drops), the
+  Apple logo is drawn several times. It used to last about 0.9 s; the vblank fix above shortened it.
+  [WhateverXe#131](https://github.com/b00t0x/WhateverXe/issues/131) explains the cause; its fix made it worse on this
+  machine, so it is not used.
 - **Rare flicker** at the bottom of translucent windows when the UHD is heavily loaded. Turning on Reduce Transparency
   hides it.
 - **Camera/microphone permissions:** with AMFI relaxed, macOS never shows the permission prompt for third-party apps.
@@ -132,7 +148,7 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   Firefox or Edge) instead.
 - **VP9 / AV1 hardware decode:** the driver does not expose them, so YouTube above 1080p is not available in Safari.
 - **Hibernation:** not set up (`hibernatemode 0`).
-- **Not tested:** the headphone jack, HDMI audio, iMessage/FaceTime, FileVault, Sidecar, AirDrop and Handoff.
+- **Not tested:** HDMI audio, FileVault, Sidecar, AirDrop and Handoff.
   (The G15 5530 has no card reader and no video output on USB-C.)
 
 ## Will it work on my G15?
@@ -186,11 +202,13 @@ still works).
 ```
 keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -allow3d -disablegfxfirmware
 amfi_get_out_of_my_way=1 gfxrst=1 -g15pm -igfxdvmt -wexdbg wexblmin=4900 -wex-blmin=4900 nvfb=1 nvaccel=1 acpi=0xC
--g15fan-rtxpm-corte
+-g15fan-rtxpm-corte wexg15psr=3 wexg15unstick=31
 ```
 
 - Required: `-allow3d -disablegfxfirmware amfi_get_out_of_my_way=1 -igfxdvmt gfxrst=1 -g15pm wexblmin=4900
   -wex-blmin=4900 nvfb=1 nvaccel=1`.
+- Optional: `-g15fan-rtxpm-corte` (cut RTX power when idle), `wexg15psr=3` (PSR1), `wexg15unstick=31` (tries to restart
+  a stuck engine before the GPU reset).
 - Logging only, safe to remove (add `-v` for a verbose boot): `keepsyms=1 debug=0x100 msgbuf=4194304 -g15diag IGLogLevel=3 -wexdbg acpi=0xC`.
 
 SIP is partly disabled (`csr-active-config` 0x0A43) and AMFI is relaxed, because the GPU bundles are re-signed ad hoc.
@@ -208,16 +226,17 @@ Know what that means for your security.
   - `SSDT-PS2K-RMCF`: VoodooPS2 settings.
 - `EFI/OC/Kexts`:
   - Lilu 1.7.3, VirtualSMC 1.3.9 (+ SMCBatteryManager, SMCProcessor), RestrictEvents 1.1.7, NVMeFix 1.1.4.
-  - AirportItlwm 2.4.0, IntelBluetoothFirmware / IntelBTPatcher 2.5.1, BlueToolFixup 2.7.3, RealtekRTL8111 3.0.0.
+  - AirportItlwm 2.4.0, IntelBluetoothFirmware / IntelBTPatcher 2.5.3, BlueToolFixup 2.7.3, RealtekRTL8111 3.0.0.
   - USBToolBox 1.2.0 + UTBDefault, XHCI-unsupported.
   - VoodooPS2Controller 2.3.8, VoodooI2C 2.9.1 (CI build 6be653a2) + VoodooI2CHID, BrightnessKeys 1.0.4.
   - AMFIPass-Mod 1.4.1.
   - WhateverGreen 1.7.2: used only by `config-install.plist`; the system config does not load it.
   - **My builds:**
     - `WhateverXe` (fork above).
-    - `G15Fan`: fans and profiles via Dell WMAX, RTX power cut in sleep, EC wake arming.
-    - `G15PM`: the XE-PM part of NootedGreen as its own Lilu plug-in, for HWP, turbo, C-states and EPP.
-    - `AudShim`: speakers and DMIC.
+    - `G15Fan`: fans and profiles via Dell WMAX, RTX power cut in sleep and when idle (`RtxPm`), EC wake arming.
+    - `G15PM`: the XE-PM part of NootedGreen as its own Lilu plug-in (HWP, turbo, C-states, EPP), plus the RTX hooks
+      (`RtxLazy`, `RtxCalls`, `RtxDeny`) and Bluetooth USB idle suspend (`BtIdle`).
+    - `AudShim`: speakers, DMIC, headphone jack and headset microphone.
     - `G15AGPMIgpu`: AGPM profile for the UHD without `RCxControl`/`CPGControl` (RC6, see "What works").
   - Sources are in `src/`.
 
@@ -247,7 +266,8 @@ every binary patch checks its bytes first, so it stops on a different driver ver
      bundle, an Apple binary that is not included here.
 3. **Metal shim `stencilfix`** (`prebuilt/stencilfix`). Fixes wrong stencil reads, the white blocks in 3D apps.
 4. **Audio HAL plug-in XeSpeakers** with DeepFilterNet3 (`prebuilt/audio`). It creates the "Alto-falantes internos"
-   (speakers) and "Microfone interno" (microphone) devices.
+   (speakers, or "Fones de ouvido" with headphones plugged in) and "Microfone interno" (microphone, or "Microfone do fone"
+   with a headset) devices.
    - The DSP firmware (Linux SOF `sof-rpl-s.ri`) is built into `AudShim.kext`.
 5. **G15.app** for your user (`prebuilt/G15.app-installer`).
    - It handles the Fn keys, keyboard light, profiles and fans, menu-bar temperatures and permission prompts.
@@ -255,7 +275,7 @@ every binary patch checks its bytes first, so it stops on a different driver ver
 6. **pmset:** battery display 3 min / sleep 5 min, AC display 5 min / sleep 15 min, `hibernatemode 0`, `standby 0`.
 
 Then do two things by hand:
-- Install **NullMoth 2.9** with its own installer. Then restrict the RTX to the apps that need it:
+- Install **NullMoth 3.0** with its own installer. Then restrict the RTX to the apps that need it:
   `sudo bash tools/rtx/macos-rtx-allow.sh restrita [app ...]`. Run this again after every NullMoth update, because the
   update resets the list.
 - Add `BOOST=0` to `/Library/GPUBundles/nvmtl/nvrm610.conf` so the RTX idles at P8.

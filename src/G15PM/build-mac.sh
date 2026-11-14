@@ -9,7 +9,7 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; cp "$S"/*.cpp "$S/Info.plist" "$W/"; cd
 NAME=G15PM; BID=local.g15.G15PM; VER=1.0.0
 FLAGS=(-arch x86_64 -mkernel -nostdinc -fno-builtin -fno-common -fno-stack-protector -mmacosx-version-min=13.0 -mmmx -msse -msse2
        -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT -DPRODUCT_NAME=$NAME -DMODULE_VERSION=$VER
-       -isystem $SDK/Headers -I$LILU -O2 -g)
+       -isystem $SDK/Headers -I$LILU -I$R/kexts/common -O2 -g)
 cat > info.c <<EOC
 #include <mach/mach_types.h>
 #include <mach/kmod.h>
@@ -22,7 +22,7 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 EOC
 clang "${FLAGS[@]}" -c info.c -o info.o
 CXX=(-std=gnu++17 -nostdinc++ -fno-exceptions -fno-rtti -fapple-kext -Wall -Wno-deprecated-declarations -Wno-unused-parameter)
-OBJ=(); for s in kern_start kern_xepm kern_rtd3 kern_wake kern_revoke g15pm_control; do clang++ "${FLAGS[@]}" "${CXX[@]}" -c $s.cpp -o $s.o; OBJ+=($s.o); done
+OBJ=(); for s in kern_start kern_xepm kern_rtd3 kern_wake kern_revoke kern_btidle g15pm_control; do clang++ "${FLAGS[@]}" "${CXX[@]}" -c $s.cpp -o $s.o; OBJ+=($s.o); done
 clang++ "${FLAGS[@]}" "${CXX[@]}" -c $LILU/Library/plugin_start.cpp -o plugin_start.o
 K=$NAME.kext; mkdir -p $K/Contents/MacOS; cp Info.plist $K/Contents/
 clang++ -arch x86_64 -mkernel -nostdlib -static -Xlinker -kext -Xlinker -export_dynamic -mmacosx-version-min=13.0 \
