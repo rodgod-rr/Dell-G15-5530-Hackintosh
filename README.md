@@ -25,7 +25,9 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - It uses [WhateverXe](https://github.com/b00t0x/WhateverXe) through my fork:
     [rodgod-rr/WhateverXe `g15-deep-idle`](https://github.com/rodgod-rr/WhateverXe/tree/g15-deep-idle)
     ([write-up](https://github.com/rodgod-rr/WhateverXe/blob/g15-deep-idle/docs/g15-deep-idle/README.md)).
-  - It needs the [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics) **0.4.0** package.
+  - It needs the [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics) **0.4.4** package (the
+    WhateverXe fork is based on 0.8.2 and publishes the activation token that Graphics 0.4.2+ requires). My patch layer
+    on top of it is also in [rodgod-rr/WhateverXe-Graphics `g15`](https://github.com/rodgod-rr/WhateverXe-Graphics/tree/g15).
 - **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 2.9. It runs
   alongside the UHD: Metal 3, about 4.9 TFLOPS.
 - **RTX powered off when idle (since 2026-11-10).** NullMoth 2.9's own RTD3 cannot cut power here (Apple's
@@ -107,10 +109,13 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   cannot cut power on this machine ([nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 when idle, saving about 12 W.
   - With the RTX visible, the CPU package almost never reaches deep C-states.
-- **UHD hang (under investigation).** Since RC6 came back, the UHD sometimes stops answering the last submission on
-  the render engine (`gpuRestart`), the screen goes black and WindowServer is killed by its watchdog. The WhateverXe
-  fork now keeps render forcewake while the render engine executes (candidate fix, on by default) and writes each
-  hang to `/private/var/log/g15-uhd-hang-*.txt`. The boot-arg `wexg15unstick=31` also tries to recover a stuck queue.
+- **UHD hang (under observation since 2026-11-13).** The UHD sometimes stopped mid context switch (`gpuRestart`), the
+  screen went black and WindowServer was killed by its watchdog. The main suspect is the old two-byte Metal leak patch,
+  which freed the POSH buffer while the queue could still use it (it caused GPU restart storms for others in
+  [WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)); Graphics 0.4.4 fixes the leak safely and the old
+  patch is gone from this repository. The WhateverXe fork also keeps forcewake on every engine while it executes and
+  releases it as soon as the engine is idle (a still screen stays at about 1.2-1.7 W of package power). Each hang is
+  written with per-engine registers to `/private/var/log/g15-uhd-hang-*.txt`; `wexg15unstick=31` tries to recover.
 - **eDP Panel Self Refresh (optional, experimental).** The boot-arg `wexg15psr=3` turns on PSR1 for the internal LG
   panel: with a still screen the package drops from about 2.05 W to 1.17 W. It once froze WindowServer with a still
   screen (possibly the same problem as the hang above), so it is off unless you add the boot-arg. The mode can be
@@ -172,7 +177,7 @@ still works).
 5. **Install macOS** from the USB stick (F12 boot menu), then boot the new install through the USB stick.
 6. **Copy the EFI to the SSD.** Mount the SSD's EFI partition and copy the EFI folder there, this time with the
    **system** `config.plist` (and your SMBIOS). Boot from the SSD.
-7. **Install the WhateverXe Graphics package 0.4.0**
+7. **Install the WhateverXe Graphics package 0.4.4**
    ([releases](https://github.com/b00t0x/WhateverXe-Graphics/releases)) and reboot. The UHD is now accelerated.
 8. **Run the post-install script** (next section), then install NullMoth.
 
@@ -230,10 +235,9 @@ sudo bash install-macos.sh install    # applies everything, then reboot
 It runs these steps, which are also separate scripts. Every patched file is backed up to `/Library/G15-uhd`, and
 every binary patch checks its bytes first, so it stops on a different driver version.
 
-1. **Metal driver memory leak fix** (`post-install/macos-mtl-leakpatch.sh`).
-   - Patches the TGL Metal driver at `0x7ed87`, `75 0d` -> `90 90`
-     ([WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)).
-   - Without it, WindowServer grows by hundreds of MB per minute.
+1. **Metal driver memory leak:** nothing to do. Graphics 0.4.4 fixes it
+   ([WhateverXe#47](https://github.com/b00t0x/WhateverXe/issues/47)); `check` warns if the old two-byte patch or a
+   leaking package is still installed. Do not use the old `0x7ed87` patch: it can hang the GPU.
 2. **VA driver patches, `avcfix` mode** (`post-install/macos-patch-wex-va.sh`).
    - Fixes H.264 hardware decode on Tahoe (key 6 of `SetParam`), plus two NULL checks.
    - Then the video post-processing fix (`post-install/macos-va-vp81.sh aplicar`,
