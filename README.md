@@ -28,24 +28,35 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
   - It needs the [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics) **0.4.4** package (the
     WhateverXe fork is based on 0.8.3 (since 2026-11-22) and publishes the activation token that Graphics 0.4.2+ requires). My patch layer
     on top of it is also in [rodgod-rr/WhateverXe-Graphics `g15`](https://github.com/rodgod-rr/WhateverXe-Graphics/tree/g15).
-- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 3.0. It runs
+  - **GT frequency governor (since 2026-11-24, on by default).** Without GuC, Apple's driver always asked for the
+    maximum GT clock (1450 MHz here), so every exit from RC6 ran at full speed
+    ([WhateverXe#176](https://github.com/b00t0x/WhateverXe/issues/176)). The fork now picks the clock from RC6
+    residency in 16 ms windows, without forcewake or MMIO writes. Measured on the GT power plane (RAPL) at 60 fps:
+    medium load 1.43 W -> 1.18 W (-17 %), light load about the same; frames take a little longer (4.0 -> 5.5 ms).
+    `sysctl debug.g15gtgov=0` turns it off live (no sudo), `debug.g15gtgov_info` shows its state, and
+    `-wex-g15-gtgov-off` disables it from boot.
+  - Fewer repeated Apple logos at boot ([WhateverXe#131](https://github.com/b00t0x/WhateverXe/issues/131)): when
+    the driver arms the plane in X-tile while the GOP console is still on screen, the fork rewrites the console in the
+    Gen12 X-tile layout (once per boot, ~110 ms; `-wex-g15-xtile-off` disables it). The large shifted logo is gone and
+    the remaining ones are shorter, but not all are gone yet.
+- **RTX 4050 for Metal/compute**, through [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) 3.1. It runs
   alongside the UHD: Metal 3, about 4.9 TFLOPS.
   - **RTX as an external GPU (since 2026-11-16, boot-arg `-g15egpu`).** `G15PM` marks the RTX as removable for Metal
     (`IOAccelDevice2::get_config` bit 13 and `Removable` on NVAccel; the kernel's own eGPU path is not used, so sleep is
     unaffected). Apps with "Prefer External GPU" in Finder > Get Info run on the RTX by themselves (Hollow Knight, the
     Novabench GPU test); everything else stays on the UHD. With this, NullMoth's default list `*` is fine.
   - **Optional: lazy start of the Metal plugin.** Every Metal app used to wake the RTX just by listing the GPUs (the
-    plugin created the whole NVK device in `initWithAcceleratorPort:`). The `g15-lazy` branch of my NullMoth fork
-    ([rodgod-rr/nvidia-macos-driver](https://github.com/rodgod-rr/nvidia-macos-driver/tree/g15-lazy),
+    plugin created the whole NVK device in `initWithAcceleratorPort:`). The `g15-lazy-31` branch of my NullMoth fork
+    ([rodgod-rr/nvidia-macos-driver](https://github.com/rodgod-rr/nvidia-macos-driver/tree/g15-lazy-31), on 3.1;
     `docs/G15-LAZY-INIT.md`) answers the device properties from a saved snapshot and starts NVK on first real use:
     Safari, TextEdit or WhatsApp no longer wake it; Preview's Live Text and games do. Not in this EFI (it replaces
     NullMoth's `NVMTLDriver`).
   - `BOOST=0` in `/Library/GPUBundles/nvmtl/nvrm610.conf` lets it drop to P8 while it is on and idle, saving about 12 W.
-- **RTX powered off when idle.** Stock NullMoth's own RTD3 (2.9 and 3.0) cannot cut power here (Apple's
+- **RTX powered off when idle.** Stock NullMoth's own RTD3 (2.9 to 3.1) cannot cut power here (Apple's
   `evaluateObject` only runs plain method names, and forcing it froze the system;
   [nullmoth#428](https://github.com/nullmoth/nvidia-macos-driver/issues/428)). There are two ways around it:
   - **NVIDIA's own GC6 (since 2026-11-22, what I use; needs my NVRM build, not included).** With an NVRM built from the
-    [`g15-gc6` branch of my NullMoth fork](https://github.com/rodgod-rr/nvidia-macos-driver/tree/g15-gc6)
+    [`g15-gc6-31` branch of my NullMoth fork](https://github.com/rodgod-rr/nvidia-macos-driver/tree/g15-gc6-31) (on 3.1; `g15-gc6` is the 3.0 version)
     (`kexts/NVRM/nv_xnu_dynpm.cpp`), NVIDIA's resource manager decides when the RTX is idle and runs the whole
     transition itself (RTD3 "OSPM" mode, no `_DSM` JT): it revokes the apps' mappings of the card
     (`IOMemoryDescriptor::redirect`), enters GC6 (VRAM kept in self-refresh), D3hot, and `G15Fan` cuts power
@@ -155,8 +166,9 @@ SSD and panel may differ, and the DSDT shipped here was dumped from my machine.
     by the QoS each app declares. This EFI uses `hcmode=4` (background only on E-cores, as on Apple Silicon): under
     heavy background load the CPU package draws about half (27 W instead of 52 W on AC), at the cost of slower
     background tasks. `hcmode=2` makes it a preference instead; `sysctl debug.hc_mode=N` changes it live.
+    `hcpower=4,2` (optional) switches the mode by itself: 4 on battery, 2 on AC.
   - `hw.nperflevels` = 2 ("Performance" 6/12, "Efficiency" 4/4) and Activity Monitor's CPU History shows
-    "Core 1-12 — Performance" and "Core 13-16 — Efficiency". System Information still shows 16 cores.
+    "Core 1-12 — Performance" and "Core 13-16 — Efficiency". System Information shows 10 cores with Hyper-Threading (16 threads).
   - CpuTopologyRebuild is included but must stay disabled: it reports the E-cores as SMT siblings, which defeats this.
 - **Dual boot with Fedora** on a separate NVMe, chosen from the Dell F12 menu.
 
