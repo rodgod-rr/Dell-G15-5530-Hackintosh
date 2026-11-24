@@ -104,7 +104,6 @@ and panel may differ, and the DSDT here was dumped from my machine. What changed
   G15.app shows its own prompt and writes the permission. (Running with AMFI on, with
   [AMFIAnchor](https://github.com/b00t0x/AMFIAnchor) and the GPU bundles signed by your own certificate authority, brings
   back macOS's own prompt; that needs your own keys, so it is not set up here.)
-- **Rare flicker** at the bottom of translucent windows under heavy GPU load. Reduce Transparency hides it.
 
 ## What does not work
 

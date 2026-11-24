@@ -31,6 +31,8 @@ What changed in this EFI and why, newest first. The [README](README.md) describe
   (AMFIAnchor and the GPU bundles signed by my own certificate authority). This EFI still relaxes AMFI, so G15.app's
   own prompt is still used here.
 - README rewritten to describe only the current state; the history moved here.
+- The rare flicker at the bottom of translucent windows under heavy GPU load is no longer seen (likely fixed by the
+  render-context workarounds of 2026-11-22); removed from "What partly works".
 
 ## 2026-11-22
 
