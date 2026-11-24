@@ -2,7 +2,7 @@
 
 The EFI I use every day on my Dell G15 5530, with what works, what partly works and what does not.
 **It is a snapshot of a working setup, not a polished guide.** Read the whole page before trying it. Your BIOS, SSD
-and panel may differ, and the DSDT here was dumped from my machine.
+and panel may differ, and the DSDT here was dumped from my machine. What changed and why: [CHANGELOG](CHANGELOG.md).
 
 | | |
 |---|---|
